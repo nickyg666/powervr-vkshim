@@ -2533,9 +2533,15 @@ static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     const VkImageCreateInfo *ci = pCreateInfo;
     VkImageCreateInfo patched;
+    /* LINEAR->OPTIMAL forcing for sampled images is opt-in (VKC_LINEAR_OPTIMAL=1).
+     * Forcing it changed per-frame texture sampling in a bad way (frame-to-frame
+     * colour cycling), so the default is OFF: run with VKC_LINEAR_OPTIMAL=1 to
+     * compare. VKC_NO_LINEAR_OPTIMAL=1 is accepted as an explicit opt-out. */
+    const char *linopt = getenv("VKC_LINEAR_OPTIMAL");
     const char *nlin = getenv("VKC_NO_LINEAR_OPTIMAL");
+    int want_optimal = (linopt && linopt[0] == '1') && !(nlin && nlin[0] == '1');
     if (pCreateInfo && pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
-        (pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !(nlin && nlin[0] == '1')) {
+        (pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && want_optimal) {
         patched = *pCreateInfo;
         patched.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci = &patched;
