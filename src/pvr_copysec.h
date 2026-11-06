@@ -18,7 +18,7 @@ void cs_track_alloc(VkDevice dev, const VkCommandBufferAllocateInfo *ai,
 void cs_track_free(VkDevice dev, uint32_t n, const VkCommandBuffer *cbs);
 void cs_track_begin(VkCommandBuffer cb);   /* app re-recording the primary */
 void cs_track_reset(VkCommandBuffer cb);   /* vkResetCommandBuffer */
-void cs_track_resetpool(VkCommandPool pool);
+void cs_track_resetpool(VkDevice dev, VkCommandPool pool);
 void cs_track_beginpass(VkCommandBuffer cb);
 void cs_track_endpass(VkCommandBuffer cb);
 void cs_destroy(void);

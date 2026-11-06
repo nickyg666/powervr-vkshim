@@ -18,7 +18,9 @@ crashes irrecoverably on retry.
 | 1 | **Pipeline compiler chokes on OpKill** (discard) | process killed asynchronously, garbage fragments in GUI text | SPIR-V rewrite of `OpKill` → branch + transparent store (default **off**, env `VKC_KILL_REWRITE=1` to re-enable) |
 | 2 | **Texel buffers (`OpTypeImage dim=Buffer`) unimplemented** | clouds pipeline fails to build; `binding UNIFORM_TEXEL_BUFFER` crashes pipeline compile | rewrite texel-buffer descriptors → storage buffer (`pvr_texelbuf.c`) |
 | 3 | **Only ONE copy executes per command buffer**: a 2nd/3rd/… `vkCmdCopyBufferToImage`/`vkCmdCopyImage`/`vkCmdBlitImage` recorded directly into the same primary is dropped or truncated to its first rows | scrambled psychedelic world, x-ray blocks, missing HUD/text — *Minecraft stitches its atlases with hundreds of copies* | route every copy/blit through our own **secondary command buffer** + `vkCmdExecuteCommands` (`pvr_copysec.c`), env `VKC_NO_COPYSEC=1` to disable |
-| 4 | Implicit-`LOD` mipmap selection wrong (investigation) | forced-`LOD0` did not fix the atlas jumble — retired as a fix, kept as a tool (`pvr_lod.c`, env `VKC_LOD0=1`) |
+| 4 | **Implicit-`LOD` sampling broken**: sampler lands on garbage mip levels | flat colour patches — *this was the "psychedelic terrain"* | clamp every sampler to **LOD 0** at `vkCreateSampler` (`VKC_CLAMP_LOD0`, default on in `mc-vulkan.sh`) |
+| 5 | LINEAR images cannot be sampled | all texture garbage | force sampled LINEAR images to OPTIMAL tiling at `vkCreateImage` (`VKC_NO_LINEAR_OPTIMAL` to disable) |
+| 6 | atlas content verified **correct** via an in-layer readback dump (`VKC_DUMP_ATLAS`) — copying never was the problem | — | — |
 
 Patch quest (all verified with the `tests/primtest*.c` reproducers):
 
@@ -66,7 +68,8 @@ disabled, otherwise the game can pick llvmpipe — see
 
 ## Env switches
 
-    VKC_NO_COPYSEC=1     disable the copy→secondary brainstorm workaround
+    VKC_CLAMP_LOD0=1       clamp every sampler to LOD 0 (driver mips broken)
+    VKC_NO_COPYSEC=1     disable the copy→secondary workaround
     VKC_NO_TEXEL=1       disable the texel-buffer rewrite
     VKC_KILL_REWRITE=1   enable the OpKill rewrite (orig. default-on experiment)
     VKC_NO_KILL_REWRITE=1  leave OpKill alone (currently the stable default)
@@ -89,9 +92,10 @@ disabled, otherwise the game can pick llvmpipe — see
   B-Series BXM-4-64 MC1 (IMGTEC)`), menu ~59 FPS.
 * texel-buffer fix (clouds) verified in game.
 * atlas/copy fix verified standalone (`primtest5`, W1 0/100 wrong).
-* in-world with `graphicsPreset:"fast"`: ~28 FPS, geometry correct.
-* remaining: world shading/lighting wrongness, cloud flicker, HUD text
-  glitches surface after long loads; FPS on `fancy` ~10.
+* in-world with `graphicsPreset:"fast"`: ~28 FPS, geometry **and** textures
+  (sharp LOD-0 sampling) now correct.
+* remaining: colour tint oddities, cloud flicker/jumping, HUD icon
+  garbling, in-world FPS on `fancy` ~10.
 
 ## Board
 

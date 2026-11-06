@@ -116,6 +116,7 @@ struct cs {
     PFN_vkCmdCopyBufferToImage2 CmdCopyBufferToImage2;
     PFN_vkCmdCopyImageToBuffer2 CmdCopyImageToBuffer2;
     PFN_vkCmdCopyImage2 CmdCopyImage2;
+    PFN_vkCmdBlitImage2 CmdBlitImage2;
 
     VkCommandBuffer batches[MAXBATCH][BATCH];
     int nbatches;
@@ -158,7 +159,7 @@ void cs_bind(VkDevice dev, gdpfunc gd)
     }
     CS.dev = dev;
     CS.gd = gd;
-#define Q(n) CS.n = (PFN_vk##n)CS.gd(CS.dev, #n)
+#define Q(n) CS.n = (PFN_vk##n)CS.gd(CS.dev, "vk" #n)
     Q(CreateCommandPool);
     Q(DestroyCommandPool);
     Q(AllocateCommandBuffers);
@@ -174,6 +175,7 @@ void cs_bind(VkDevice dev, gdpfunc gd)
     Q(CmdCopyBufferToImage2);
     Q(CmdCopyImageToBuffer2);
     Q(CmdCopyImage2);
+    Q(CmdBlitImage2);
 #undef Q
     if (!CS.pool && CS.CreateCommandPool) {
         VkCommandPoolCreateInfo ci;
@@ -376,10 +378,12 @@ void cs_destroy(void)
 
 static int route_ok(VkCommandBuffer prim)
 {
-    if (cs_envoff())
+    if (cs_envoff()) { cs_log("reject: VKC_NO_COPYSEC"); return 0; }
+    if (!CS.resolved || !CS.pool || !CS.CmdExecuteCommands) {
+        cs_log("reject: resolved=%d pool=%p exec=%p dev=%p", CS.resolved,
+               (void*)CS.pool, (void*)CS.CmdExecuteCommands, (void*)CS.dev);
         return 0;
-    if (!CS.resolved || !CS.pool || !CS.CmdExecuteCommands)
-        return 0;
+    }
     struct trec *t = t_find(prim);
     if (t && t->is_secondary)
         return 0; /* vkCmdExecuteCommands is invalid inside a secondary */
@@ -399,6 +403,7 @@ static int route_generic(VkCommandBuffer prim, uint32_t n,
         return 0;
     pthread_mutex_lock(&cs_lck);
     o = cs_owner_of(&CS, prim);
+    cs_log("route attempt prim=%p owner=%p", (void*)prim, (void*)o);
     if (o) {
         sec = cs_sec_get(&CS);
         if (sec && o->cnt < SECPERPRIMMAX) {
@@ -624,13 +629,52 @@ int cs_route_blit2(VkCommandBuffer prim, VkImage src, VkImageLayout sl,
                    VkImage dst, VkImageLayout dl, uint32_t n,
                    const VkImageBlit2 *rgs, VkFilter filter)
 {
-    struct cb_bi2 {
-        VkImage src, dst;
-        VkImageLayout sl, dl;
-        uint32_t n;
-        const VkImageBlit2 *rgs;
-        VkFilter filter;
-    } a = {src, dst, sl, dl, n, rgs, filter};
-    (void)a;
-    return route_generic2(prim, n, BLIT2, &a);
+    struct owner *o;
+    VkCommandBuffer sec;
+    VkCommandBufferBeginInfo bi;
+    int handled = 0;
+    if (n == 0 || !route_ok(prim))
+        return 0;
+    pthread_mutex_lock(&cs_lck);
+    o = cs_owner_of(&CS, prim);
+    cs_log("route attempt prim=%p owner=%p", (void*)prim, (void*)o);
+    if (o) {
+        sec = cs_sec_get(&CS);
+        if (sec && o->cnt < SECPERPRIMMAX) {
+            if (o->cap == o->cnt) {
+                int nc = o->cap * 2;
+                VkCommandBuffer *ns =
+                    realloc(o->secs, (size_t)nc * sizeof(VkCommandBuffer));
+                if (ns) {
+                    o->secs = ns;
+                    o->cap = nc;
+                }
+            }
+            if (o->cap != o->cnt) {
+                memset(&bi, 0, sizeof(bi));
+                bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                o->secs[o->cnt++] = sec;
+                CS.BeginCommandBuffer(sec, &bi);
+                VkBlitImageInfo2 info;
+                memset(&info, 0, sizeof(info));
+                info.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+                info.srcImage = src;
+                info.srcImageLayout = sl;
+                info.dstImage = dst;
+                info.dstImageLayout = dl;
+                info.filter = filter;
+                for (uint32_t i2 = 0; i2 < n; i2++) {
+                    info.regionCount = 1;
+                    info.pRegions = &rgs[i2];
+                    CS.CmdBlitImage2(sec, &info);
+                }
+                CS.EndCommandBuffer(sec);
+                CS.CmdExecuteCommands(prim, 1, &sec);
+                CS.nroutes++;
+                handled = 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&cs_lck);
+    return handled;
 }

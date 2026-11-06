@@ -25,6 +25,15 @@ export SDL_VIDEODRIVER=x11
 export VKC_DIR="${VKC_DIR:-/tmp/vkcompat}"
 export VKC_CAPTURE_STDERR=1
 export VKC_REQUIRE_VULKAN=1
+# The PowerVR driver samples mips wrongly (implicit LOD lands on garbage
+# levels -> flat colour patches); clamp every sampler to LOD 0. Textures
+# render correctly (with LOD 0) and only shimmer at a distance.
+export VKC_CLAMP_LOD0=1
+# The OpKill->discard rewrite breaks the GUI font rendering; leave the
+# discard in place (the driver handles most of them fine) and skip the
+# over-broad OIT state fix.
+export VKC_NO_KILL_REWRITE=1
+export VKC_OIT_FIX=0
 # Mesa's device_select layer hangs when it is combined with the compatibility
 # layer; it only selects between several GPUs and this system has one.
 export NODEVICE_SELECT=1
@@ -70,7 +79,7 @@ FORCE = {
     'exclusiveFullscreen': 'false',   # so that the screen can be captured
     'entityShadows': 'false',
     'mipmapLevels': '0',
-    'graphicsPreset': 'custom',
+    'graphicsPreset': 'fast',
 }
 lines, seen = [], set()
 try:

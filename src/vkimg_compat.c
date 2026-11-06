@@ -56,6 +56,7 @@
 #include "minimal_fs.h"
 #include "pvr_spirv_descriptors.h"
 #include "pvr_texelbuf.h"
+#include "pvr_copysec.h"
 
 /* ------------------------------------------------------------------ */
 /* crash handler - tells us exactly which driver call killed us        */
@@ -114,6 +115,14 @@ static void segv_handler(int sig, siginfo_t *si, void *ctx)
 
 static PFN_vkGetInstanceProcAddr next_gipa;
 static PFN_vkGetDeviceProcAddr next_gdpa;
+static VkPhysicalDevice g_pd = VK_NULL_HANDLE;
+/* atlas dump via worker thread (avoids allocating during command recording) */
+static VkBuffer     g_atlas_dbg = VK_NULL_HANDLE;
+static VkDeviceMemory g_atlas_dbgmem = VK_NULL_HANDLE;
+static uint8_t     *g_atlas_ptr = NULL;
+static VkImage      g_atlas_img = VK_NULL_HANDLE;
+static VkImageLayout g_atlas_lay = VK_IMAGE_LAYOUT_UNDEFINED;
+static int          g_atlas_done = 0;
 static PFN_vkLayerCreateDevice next_layer_create_device;
 static VkInstance layer_instance;
 
@@ -1275,6 +1284,7 @@ static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
      * layer chain and fills the device dispatch table - using it is what makes
      * the loader route the device level calls through this layer.
      */
+    g_pd = physicalDevice;
     if (next_gipa) {
         PFN_vkCreateDevice next_create =
             (PFN_vkCreateDevice)next_gipa(layer_instance ? layer_instance : VK_NULL_HANDLE,
@@ -1302,12 +1312,20 @@ static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
     return r;
 }
 
+static int atlas_spawned;
 static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
                                                    const VkShaderModuleCreateInfo *pCreateInfo,
                                                    const VkAllocationCallbacks *pAllocator,
                                                    VkShaderModule *pShaderModule)
 {
     resolve_device();
+    if (!atlas_spawned && getenv("VKC_DUMP_ATLAS") && g_dev && g_pd) {
+        atlas_spawned = 1;
+        extern void *atlas_worker(void *);
+        pthread_t th;
+        pthread_create(&th, NULL, atlas_worker, NULL);
+        pthread_detach(th);
+    }
 
     /*
      * The PowerVR pipeline compiler chokes on OpKill (discard) inside
@@ -2079,7 +2097,14 @@ static VkResult VKAPI_CALL wrapped_CreateSampler(VkDevice device,
 {
     resolve_device();
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
-    if (real_CreateSampler)
+    if (getenv("VKC_CLAMP_LOD0")) {
+        VkSamplerCreateInfo patched = *pCreateInfo;
+        patched.minLod = 0.0f;
+        patched.maxLod = 0.0f;
+        patched.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        if (real_CreateSampler)
+            r = real_CreateSampler(device, &patched, pAllocator, pSampler);
+    } else if (real_CreateSampler)
         r = real_CreateSampler(device, pCreateInfo, pAllocator, pSampler);
     if (r == VK_SUCCESS && pCreateInfo && getenv("VKC_LOG_IMAGES"))
         LOG("sampler %p: mag=%d min=%d mipmapMode=%d minLod=%.2f maxLod=%.2f maxAniso=%f",
@@ -2088,6 +2113,8 @@ static VkResult VKAPI_CALL wrapped_CreateSampler(VkDevice device,
             pCreateInfo->minLod, pCreateInfo->maxLod, pCreateInfo->maxAnisotropy);
     return r;
 }
+
+static void resolve_copyfns(void);
 
 static void VKAPI_CALL wrapped_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
                                                     VkBuffer srcBuffer,
@@ -2110,9 +2137,309 @@ static void VKAPI_CALL wrapped_CmdCopyBufferToImage(VkCommandBuffer commandBuffe
                 pRegions[i].bufferImageHeight);
         }
     }
+    resolve_copyfns();
+    static int atlas_seen;
+    if (getenv("VKC_DUMP_ATLAS") && pRegions)
+        for (uint32_t ri = 0; ri < regionCount; ri++)
+            if (pRegions[ri].imageExtent.width == 1024 &&
+                pRegions[ri].imageExtent.height == 1024 &&
+                pRegions[ri].imageOffset.x == 0 && pRegions[ri].imageOffset.y == 0)
+                atlas_seen++;
+    int handled = cs_route_bti(commandBuffer, srcBuffer, dstImage, dstImageLayout,
+                     regionCount, pRegions);
+    if (handled && getenv("VKC_DUMP_ATLAS") && atlas_seen >= 6 && !g_atlas_done &&
+        g_atlas_dbg && g_atlas_ptr) {
+        PFN_vkCmdPipelineBarrier rq3 =
+            (PFN_vkCmdPipelineBarrier)next_gdpa(g_dev, "vkCmdPipelineBarrier");
+        VkImageMemoryBarrier b = {0};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = dstImageLayout;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.image = dstImage;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.levelCount = 1;
+        b.subresourceRange.layerCount = 1;
+        rq3(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        VkBufferImageCopy rb = {0};
+        rb.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rb.imageSubresource.layerCount = 1;
+        rb.imageExtent.width = 1024;
+        rb.imageExtent.height = 1024;
+        rb.imageExtent.depth = 1;
+        PFN_vkCmdCopyImageToBuffer rq4 =
+            (PFN_vkCmdCopyImageToBuffer)next_gdpa(g_dev, "vkCmdCopyImageToBuffer");
+        rq4(commandBuffer, dstImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_atlas_dbg, 1, &rb);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.newLayout = dstImageLayout;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.dstAccessMask = 0;
+        rq3(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        g_atlas_done = 1;
+        LOG("atlas readback recorded");
+    }
+    if (handled)
+        return;
     if (real_CmdCopyBufferToImage)
         real_CmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout,
                                  regionCount, pRegions);
+}
+
+/* ------------------------------------------------------------------ */
+/* pvr_copysec wiring: all remaining copy/blit families are routed the  */
+/* same way (see pvr_copysec.c), plus the command buffer state trackers */
+/* ------------------------------------------------------------------ */
+static PFN_vkCmdCopyImage real_CmdCopyImage;
+static PFN_vkCmdCopyImageToBuffer real_CmdCopyImageToBuffer;
+static PFN_vkCmdBlitImage real_CmdBlitImage;
+static PFN_vkCmdCopyBufferToImage2 real_CmdCopyBufferToImage2;
+static PFN_vkCmdCopyImageToBuffer2 real_CmdCopyImageToBuffer2;
+static PFN_vkCmdCopyImage2 real_CmdCopyImage2;
+static PFN_vkCmdBlitImage2 real_CmdBlitImage2;
+static PFN_vkAllocateCommandBuffers real_AllocateCommandBuffers;
+static PFN_vkFreeCommandBuffers real_FreeCommandBuffers;
+static PFN_vkBeginCommandBuffer real_BeginCommandBuffer;
+static PFN_vkResetCommandBuffer real_ResetCommandBuffer;
+static PFN_vkResetCommandPool real_ResetCommandPool;
+static PFN_vkCmdBeginRenderPass real_CmdBeginRenderPass;
+static PFN_vkCmdEndRenderPass real_CmdEndRenderPass;
+static PFN_vkCmdBeginRenderPass2 real_CmdBeginRenderPass2;
+static PFN_vkCmdEndRenderPass2 real_CmdEndRenderPass2;
+
+static void resolve_copyfns(void)
+{
+    if (!g_dev || real_CmdCopyImage)
+        return;
+#define RQ(name) \
+    real_##name = (PFN_vk##name)(next_gdpa ? next_gdpa(g_dev, "vk" #name) : dev_lookup("vk" #name))
+    RQ(CmdCopyImage);
+    RQ(CmdCopyImageToBuffer);
+    RQ(CmdBlitImage);
+    RQ(CmdCopyBufferToImage2);
+    RQ(CmdCopyImageToBuffer2);
+    RQ(CmdCopyImage2);
+    RQ(CmdBlitImage2);
+    RQ(AllocateCommandBuffers);
+    RQ(FreeCommandBuffers);
+    RQ(BeginCommandBuffer);
+    RQ(ResetCommandBuffer);
+    RQ(ResetCommandPool);
+    RQ(CmdBeginRenderPass);
+    RQ(CmdEndRenderPass);
+    RQ(CmdBeginRenderPass2);
+    RQ(CmdEndRenderPass2);
+#undef RQ
+    if (next_gdpa)
+        cs_bind(g_dev, next_gdpa);
+    LOG("copysec: routing active");
+}
+
+static void VKAPI_CALL wrapped_CmdCopyImage(VkCommandBuffer cb, VkImage src,
+                                            VkImageLayout sl, VkImage dst,
+                                            VkImageLayout dl, uint32_t n,
+                                            const VkImageCopy *r)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (cs_route_copyimage(cb, src, sl, dst, dl, n, r))
+        return;
+    if (real_CmdCopyImage)
+        real_CmdCopyImage(cb, src, sl, dst, dl, n, r);
+}
+
+static void VKAPI_CALL wrapped_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src,
+                                                    VkImageLayout sl, VkBuffer dst,
+                                                    uint32_t n,
+                                                    const VkBufferImageCopy *r)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (cs_route_itb(cb, src, sl, dst, n, r))
+        return;
+    if (real_CmdCopyImageToBuffer)
+        real_CmdCopyImageToBuffer(cb, src, sl, dst, n, r);
+}
+
+static void VKAPI_CALL wrapped_CmdBlitImage(VkCommandBuffer cb, VkImage src,
+                                            VkImageLayout sl, VkImage dst,
+                                            VkImageLayout dl, uint32_t n,
+                                            const VkImageBlit *r, VkFilter f)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (cs_route_blit(cb, src, sl, dst, dl, n, r, f))
+        return;
+    if (real_CmdBlitImage)
+        real_CmdBlitImage(cb, src, sl, dst, dl, n, r, f);
+}
+
+static void VKAPI_CALL wrapped_CmdCopyBufferToImage2(VkCommandBuffer cb,
+                                                     const VkCopyBufferToImageInfo2 *i)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (i && cs_route_bti2(cb, i->srcBuffer, i->dstImage, i->dstImageLayout,
+                           i->regionCount, i->pRegions))
+        return;
+    if (real_CmdCopyBufferToImage2)
+        real_CmdCopyBufferToImage2(cb, i);
+}
+
+static void VKAPI_CALL wrapped_CmdCopyImageToBuffer2(VkCommandBuffer cb,
+                                                     const VkCopyImageToBufferInfo2 *i)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (i && cs_route_itb2(cb, i->srcImage, i->srcImageLayout, i->dstBuffer,
+                           i->regionCount, i->pRegions))
+        return;
+    if (real_CmdCopyImageToBuffer2)
+        real_CmdCopyImageToBuffer2(cb, i);
+}
+
+static void VKAPI_CALL wrapped_CmdCopyImage2(VkCommandBuffer cb,
+                                             const VkCopyImageInfo2 *i)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (i && cs_route_copyimage2(cb, i->srcImage, i->srcImageLayout,
+                                 i->dstImage, i->dstImageLayout,
+                                 i->regionCount, i->pRegions))
+        return;
+    if (real_CmdCopyImage2)
+        real_CmdCopyImage2(cb, i);
+}
+
+static void VKAPI_CALL wrapped_CmdBlitImage2(VkCommandBuffer cb,
+                                             const VkBlitImageInfo2 *i)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (i && cs_route_blit2(cb, i->srcImage, i->srcImageLayout, i->dstImage,
+                            i->dstImageLayout, i->regionCount, i->pRegions,
+                            i->filter))
+        return;
+    if (real_CmdBlitImage2)
+        real_CmdBlitImage2(cb, i);
+}
+
+static VkResult VKAPI_CALL wrapped_AllocateCommandBuffers(
+    VkDevice device, const VkCommandBufferAllocateInfo *pAllocateInfo,
+    VkCommandBuffer *pCommandBuffers)
+{
+    resolve_device();
+    resolve_copyfns();
+    VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+    if (real_AllocateCommandBuffers)
+        r = real_AllocateCommandBuffers(device, pAllocateInfo, pCommandBuffers);
+    if (r == VK_SUCCESS)
+        cs_track_alloc(device, pAllocateInfo, pCommandBuffers);
+    return r;
+}
+
+static void VKAPI_CALL wrapped_FreeCommandBuffers(VkDevice device,
+                                                  VkCommandPool pool,
+                                                  uint32_t n,
+                                                  const VkCommandBuffer *cbs)
+{
+    resolve_device();
+    resolve_copyfns();
+    cs_track_free(device, n, cbs);
+    if (real_FreeCommandBuffers)
+        real_FreeCommandBuffers(device, pool, n, cbs);
+}
+
+static VkResult VKAPI_CALL wrapped_BeginCommandBuffer(
+    VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi)
+{
+    resolve_device();
+    resolve_copyfns();
+    cs_track_begin(cb);
+    if (g_atlas_done >= 1 && g_atlas_ptr) {
+        FILE *f = fopen("/tmp/atlas.ppm", "wb");
+        if (f) {
+            fprintf(f, "P6\n1024 1024\n255\n");
+            for (int y = 1023; y >= 0; y--)
+                fwrite(g_atlas_ptr + (size_t)y * 1024 * 4, 1, 1024 * 3, f);
+            fclose(f);
+        }
+        g_atlas_done++;
+        if (g_atlas_done == 2)
+            LOG("atlas dumped to /tmp/atlas.ppm");
+    }
+    if (real_BeginCommandBuffer)
+        return real_BeginCommandBuffer(cb, bi);
+    return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static void VKAPI_CALL wrapped_ResetCommandBuffer(VkCommandBuffer cb,
+                                                  VkCommandBufferResetFlags f)
+{
+    resolve_device();
+    resolve_copyfns();
+    cs_track_reset(cb);
+    if (real_ResetCommandBuffer)
+        real_ResetCommandBuffer(cb, f);
+}
+
+static void VKAPI_CALL wrapped_ResetCommandPool(VkDevice device,
+                                                VkCommandPool pool,
+                                                VkCommandPoolResetFlags f)
+{
+    resolve_device();
+    resolve_copyfns();
+    cs_track_resetpool(device, pool);
+    if (real_ResetCommandPool)
+        real_ResetCommandPool(device, pool, f);
+}
+
+static void VKAPI_CALL wrapped_CmdBeginRenderPassTracking(
+    VkCommandBuffer cb, const VkRenderPassBeginInfo *i, VkSubpassContents c)
+{
+    resolve_copyfns();
+    cs_track_beginpass(cb);
+    if (real_CmdBeginRenderPass)
+        real_CmdBeginRenderPass(cb, i, c);
+}
+
+static void VKAPI_CALL wrapped_CmdEndRenderPassTracking(VkCommandBuffer cb)
+{
+    resolve_copyfns();
+    cs_track_endpass(cb);
+    if (real_CmdEndRenderPass)
+        real_CmdEndRenderPass(cb);
+}
+
+static void VKAPI_CALL wrapped_CmdBeginRenderPass2Tracking(
+    VkCommandBuffer cb, const VkRenderPassBeginInfo *i,
+    const VkSubpassBeginInfo *i2)
+{
+    resolve_copyfns();
+    cs_track_beginpass(cb);
+    if (real_CmdBeginRenderPass2)
+        real_CmdBeginRenderPass2(cb, i, i2);
+}
+
+static void VKAPI_CALL wrapped_CmdEndRenderPass2Tracking(
+    VkCommandBuffer cb, const VkSubpassEndInfo *i)
+{
+    resolve_copyfns();
+    cs_track_endpass(cb);
+    if (real_CmdEndRenderPass2)
+        real_CmdEndRenderPass2(cb, i);
+}
+
+static void VKAPI_CALL wrapped_DestroyDeviceHook(VkDevice device,
+                                                 const VkAllocationCallbacks *a)
+{
+    resolve_device();
+    resolve_copyfns();
+    cs_destroy();
+    if (real_DestroyDevice)
+        real_DestroyDevice(device, a);
+    g_dev = VK_NULL_HANDLE;
 }
 
 static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
@@ -2122,8 +2449,18 @@ static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
 {
     resolve_device();
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+    const VkImageCreateInfo *ci = pCreateInfo;
+    VkImageCreateInfo patched;
+    if (pCreateInfo && pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+        (pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        patched = *pCreateInfo;
+        patched.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci = &patched;
+        LOG("image tiling forced optimal: %dx%d format=%d", pCreateInfo->extent.width,
+            pCreateInfo->extent.height, (int)pCreateInfo->format);
+    }
     if (real_CreateImage)
-        r = real_CreateImage(device, pCreateInfo, pAllocator, pImage);
+        r = real_CreateImage(device, ci, pAllocator, pImage);
     if (r == VK_SUCCESS && pCreateInfo && getenv("VKC_LOG_IMAGES"))
         LOG("image %p: %dx%d format=%d mips=%u layers=%u samples=%d tiling=%d usage=0x%x",
             (void *)(pImage ? *pImage : NULL), pCreateInfo->extent.width,
@@ -2342,6 +2679,40 @@ static PFN_vkVoidFunction intercept(const char *name)
         return (PFN_vkVoidFunction)wrapped_CreateImage;
     if (strcmp(name, "vkCmdCopyBufferToImage") == 0)
         return (PFN_vkVoidFunction)wrapped_CmdCopyBufferToImage;
+    if (strcmp(name, "vkCmdCopyImage") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdCopyImage;
+    if (strcmp(name, "vkCmdCopyImageToBuffer") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdCopyImageToBuffer;
+    if (strcmp(name, "vkCmdBlitImage") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdBlitImage;
+    if (strcmp(name, "vkCmdCopyBufferToImage2") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdCopyBufferToImage2;
+    if (strcmp(name, "vkCmdCopyImageToBuffer2") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdCopyImageToBuffer2;
+    if (strcmp(name, "vkCmdCopyImage2") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdCopyImage2;
+    if (strcmp(name, "vkCmdBlitImage2") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdBlitImage2;
+    if (strcmp(name, "vkAllocateCommandBuffers") == 0)
+        return (PFN_vkVoidFunction)wrapped_AllocateCommandBuffers;
+    if (strcmp(name, "vkFreeCommandBuffers") == 0)
+        return (PFN_vkVoidFunction)wrapped_FreeCommandBuffers;
+    if (strcmp(name, "vkBeginCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)wrapped_BeginCommandBuffer;
+    if (strcmp(name, "vkResetCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)wrapped_ResetCommandBuffer;
+    if (strcmp(name, "vkResetCommandPool") == 0)
+        return (PFN_vkVoidFunction)wrapped_ResetCommandPool;
+    if (strcmp(name, "vkCmdBeginRenderPass") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPassTracking;
+    if (strcmp(name, "vkCmdEndRenderPass") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdEndRenderPassTracking;
+    if (strcmp(name, "vkCmdBeginRenderPass2") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPass2Tracking;
+    if (strcmp(name, "vkCmdEndRenderPass2") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdEndRenderPass2Tracking;
+    if (strcmp(name, "vkDestroyDevice") == 0)
+        return (PFN_vkVoidFunction)wrapped_DestroyDeviceHook;
     if (strcmp(name, "vkCreateImageView") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateImageView;
     if (strcmp(name, "vkCreateSampler") == 0)
@@ -2586,4 +2957,59 @@ __attribute__((constructor)) static void shim_init(void)
 
     LOG("shim_init: driver=%p gipa=%p gdpa=%p repair=%d requireVulkan=%d dir=%s", g_drv,
         (void *)g_drv_gipa, (void *)g_drv_gdpa, g_repair, g_require_vulkan, g_dir);
+}
+
+/* runs on a detached worker thread: allocate the readback buffer safely */
+void *atlas_worker(void *arg)
+{
+    (void)arg;
+    LOG("atlas worker starting");
+    if (!g_dev || !g_pd || !next_gdpa)
+        return NULL;
+    PFN_vkCreateBuffer cb = (PFN_vkCreateBuffer)next_gdpa(g_dev, "vkCreateBuffer");
+    PFN_vkAllocateMemory am = (PFN_vkAllocateMemory)next_gdpa(g_dev, "vkAllocateMemory");
+    PFN_vkMapMemory mm = (PFN_vkMapMemory)next_gdpa(g_dev, "vkMapMemory");
+    if (!cb || !am || !mm)
+        return NULL;
+    VkBufferCreateInfo bci = {0};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = 1024 * 1024 * 4;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    LOG("atlas: create buffer...");
+    cb(g_dev, &bci, NULL, &g_atlas_dbg);
+    LOG("atlas: buffer created");
+    PFN_vkGetBufferMemoryRequirements rq =
+        (PFN_vkGetBufferMemoryRequirements)next_gdpa(g_dev, "vkGetBufferMemoryRequirements");
+    VkMemoryRequirements mr = {0};
+    LOG("atlas: get requirements...");
+    rq(g_dev, g_atlas_dbg, &mr);
+    LOG("atlas: got requirements");
+    PFN_vkGetPhysicalDeviceMemoryProperties rmp =
+        (PFN_vkGetPhysicalDeviceMemoryProperties)(next_gipa ? next_gipa(layer_instance, "vkGetPhysicalDeviceMemoryProperties") : NULL);
+    VkPhysicalDeviceMemoryProperties mp = {0};
+    LOG("atlas: get phys props...");
+    rmp(g_pd, &mp);
+    LOG("atlas: got phys props");
+    VkMemoryAllocateInfo mai = {0};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size;
+    for (uint32_t ti = 0; ti < mp.memoryTypeCount; ti++)
+        if ((mr.memoryTypeBits & (1u << ti)) &&
+            (mp.memoryTypes[ti].propertyFlags &
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            mai.memoryTypeIndex = ti;
+            break;
+        }
+    LOG("atlas: allocate...");
+    am(g_dev, &mai, NULL, &g_atlas_dbgmem);
+    LOG("atlas: allocated");
+    PFN_vkBindBufferMemory rq2 =
+        (PFN_vkBindBufferMemory)next_gdpa(g_dev, "vkBindBufferMemory");
+    rq2(g_dev, g_atlas_dbg, g_atlas_dbgmem, 0);
+    LOG("atlas: map...");
+    mm(g_dev, g_atlas_dbgmem, 0, VK_WHOLE_SIZE, 0, (void **)&g_atlas_ptr);
+    LOG("atlas: mapped");
+    LOG("atlas dbg buffer ready (worker)");
+    return NULL;
 }
