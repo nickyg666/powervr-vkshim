@@ -1,0 +1,28 @@
+# the first bug reproducers live in tests/ — the driver follows this order:
+#   primtest   raw copy-with-offset probes (first pass, incorrect conclusions)
+#   primtest2  isolated copies, every primitive works correctly
+#   primtest3  THE BUG: 3+ copies into one image in one command buffer
+#   primtest4  CopyBuffer repeats fine; secondaries hit the same bug
+#   primtest5  scale test: 100-copy atlas through one secondary,validation
+*.o
+*.so
+primtest
+primtest2
+primtest3
+primtest4
+primtest5
+offtest
+formats
+pt2
+pt2nofeat
+r8test
+r8upload
+pipetest
+desctest
+gdpatest
+spvtest
+feat
+pvrquery
+drmshot
+*.spv
+__pycache__/
