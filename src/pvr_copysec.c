@@ -340,6 +340,12 @@ void cs_track_resetpool(VkDevice dev, VkCommandPool pool)
     pthread_mutex_unlock(&cs_lck);
 }
 
+int cs_in_pass(VkCommandBuffer cb)
+{
+    struct trec *t = t_find(cb);
+    return t && t->in_pass;
+}
+
 static void cs_track_pass(VkCommandBuffer cb, int set)
 {
     pthread_mutex_lock(&cs_lck);

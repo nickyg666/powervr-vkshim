@@ -116,6 +116,22 @@ static void segv_handler(int sig, siginfo_t *si, void *ctx)
 static PFN_vkGetInstanceProcAddr next_gipa;
 static PFN_vkGetDeviceProcAddr next_gdpa;
 static VkPhysicalDevice g_pd = VK_NULL_HANDLE;
+/* view -> image map for the dump */
+static VkImageView g_viewmap[512];
+static VkImage   g_viewimgs[512];
+static int       g_viewn;
+static int       g_rt_done;
+static int       g_ubo_done;
+static int       g_rt_big_done;
+
+void *vimg(void *view)
+{
+    for (int i = 0; i < g_viewn; i++)
+        if (g_viewmap[i] == view)
+            return g_viewimgs[i];
+    return NULL;
+}
+
 /* atlas dump via worker thread (avoids allocating during command recording) */
 static VkBuffer     g_atlas_dbg = VK_NULL_HANDLE;
 static VkDeviceMemory g_atlas_dbgmem = VK_NULL_HANDLE;
@@ -1293,6 +1309,12 @@ static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
             VkResult res = next_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
             if (res == VK_SUCCESS && pDevice && *pDevice)
                 g_dev = *pDevice;
+            if (res == VK_SUCCESS && getenv("VKC_DUMP_ATLAS")) {
+                extern void *atlas_worker(void *);
+                pthread_t th;
+                pthread_create(&th, NULL, atlas_worker, NULL);
+                pthread_detach(th);
+            }
             resolve_device();
             LOG("CreateDevice r=%d device=%p next_gdpa=%p", res, (void *)(pDevice ? *pDevice : NULL),
                 (void *)next_gdpa);
@@ -1312,20 +1334,13 @@ static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
     return r;
 }
 
-static int atlas_spawned;
+
 static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
                                                    const VkShaderModuleCreateInfo *pCreateInfo,
                                                    const VkAllocationCallbacks *pAllocator,
                                                    VkShaderModule *pShaderModule)
 {
     resolve_device();
-    if (!atlas_spawned && getenv("VKC_DUMP_ATLAS") && g_dev && g_pd) {
-        atlas_spawned = 1;
-        extern void *atlas_worker(void *);
-        pthread_t th;
-        pthread_create(&th, NULL, atlas_worker, NULL);
-        pthread_detach(th);
-    }
 
     /*
      * The PowerVR pipeline compiler chokes on OpKill (discard) inside
@@ -2082,11 +2097,18 @@ static VkResult VKAPI_CALL wrapped_CreateImageView(VkDevice device,
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (real_CreateImageView)
         r = real_CreateImageView(device, pCreateInfo, pAllocator, pView);
+    if (r == VK_SUCCESS && pView && g_viewn < 512) {
+        g_viewmap[g_viewn] = *pView;
+        g_viewimgs[g_viewn] = pCreateInfo->image;
+        g_viewn++;
+    }
     if (r == VK_SUCCESS && pCreateInfo && getenv("VKC_LOG_IMAGES"))
-        LOG("image view %p: format=%d type=%d aspect=0x%x baseMip=%u levelCount=%u",
-            (void *)(pView ? *pView : NULL), (int)pCreateInfo->format, (int)pCreateInfo->viewType,
+        LOG("image view %p: image=%p format=%d type=%d aspect=0x%x baseMip=%u levelCount=%u baseLayer=%u layerCount=%u",
+            (void *)(pView ? *pView : NULL), (void *)pCreateInfo->image,
+            (int)pCreateInfo->format, (int)pCreateInfo->viewType,
             pCreateInfo->subresourceRange.aspectMask, pCreateInfo->subresourceRange.baseMipLevel,
-            pCreateInfo->subresourceRange.levelCount);
+            pCreateInfo->subresourceRange.levelCount, pCreateInfo->subresourceRange.baseArrayLayer,
+            pCreateInfo->subresourceRange.layerCount);
     return r;
 }
 
@@ -2191,6 +2213,7 @@ static void VKAPI_CALL wrapped_CmdCopyBufferToImage(VkCommandBuffer commandBuffe
 /* pvr_copysec wiring: all remaining copy/blit families are routed the  */
 /* same way (see pvr_copysec.c), plus the command buffer state trackers */
 /* ------------------------------------------------------------------ */
+static PFN_vkCreateBuffer real_CreateBufferH;
 static PFN_vkCmdCopyImage real_CmdCopyImage;
 static PFN_vkCmdCopyImageToBuffer real_CmdCopyImageToBuffer;
 static PFN_vkCmdBlitImage real_CmdBlitImage;
@@ -2207,6 +2230,7 @@ static PFN_vkCmdBeginRenderPass real_CmdBeginRenderPass;
 static PFN_vkCmdEndRenderPass real_CmdEndRenderPass;
 static PFN_vkCmdBeginRenderPass2 real_CmdBeginRenderPass2;
 static PFN_vkCmdEndRenderPass2 real_CmdEndRenderPass2;
+static PFN_vkCmdBindVertexBuffers real_CmdBindVertexBuffers;
 
 static void resolve_copyfns(void)
 {
@@ -2228,8 +2252,13 @@ static void resolve_copyfns(void)
     RQ(ResetCommandPool);
     RQ(CmdBeginRenderPass);
     RQ(CmdEndRenderPass);
+    RQ(CmdBindVertexBuffers);
+    real_CreateBufferH = (PFN_vkCreateBuffer)(next_gdpa ? next_gdpa(g_dev, "vkCreateBuffer") : dev_lookup("vkCreateBuffer"));
+
     RQ(CmdBeginRenderPass2);
     RQ(CmdEndRenderPass2);
+    RQ(CmdBindVertexBuffers);
+    real_CreateBufferH = (PFN_vkCreateBuffer)(next_gdpa ? next_gdpa(g_dev, "vkCreateBuffer") : dev_lookup("vkCreateBuffer"));
 #undef RQ
     if (next_gdpa)
         cs_bind(g_dev, next_gdpa);
@@ -2357,7 +2386,9 @@ static VkResult VKAPI_CALL wrapped_BeginCommandBuffer(
     resolve_device();
     resolve_copyfns();
     cs_track_begin(cb);
-    if (g_atlas_done >= 1 && g_atlas_ptr) {
+    { static int dbgN; if (++dbgN <= 3) LOG("begin #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
+    if ((g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
+        LOG("DUMPING atlas.ppm");
         FILE *f = fopen("/tmp/atlas.ppm", "wb");
         if (f) {
             fprintf(f, "P6\n1024 1024\n255\n");
@@ -2380,6 +2411,19 @@ static void VKAPI_CALL wrapped_ResetCommandBuffer(VkCommandBuffer cb,
     resolve_device();
     resolve_copyfns();
     cs_track_reset(cb);
+    { static int dbgN; if (++dbgN <= 3) LOG("reset #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
+    if ((g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
+        FILE *f = fopen("/tmp/atlas.ppm", "wb");
+        if (f) {
+            fprintf(f, "P6\n1024 1024\n255\n");
+            for (int y = 1023; y >= 0; y--)
+                fwrite(g_atlas_ptr + (size_t)y * 1024 * 4, 1, 1024 * 3, f);
+            fclose(f);
+        }
+        LOG("DUMPING atlas.ppm (at reset)");
+        g_atlas_done = 0;
+        g_ubo_done = 0;
+    }
     if (real_ResetCommandBuffer)
         real_ResetCommandBuffer(cb, f);
 }
@@ -2431,6 +2475,44 @@ static void VKAPI_CALL wrapped_CmdEndRenderPass2Tracking(
         real_CmdEndRenderPass2(cb, i);
 }
 
+static void VKAPI_CALL wrapped_CmdBindVertexBuffers(VkCommandBuffer cb,
+                                                  uint32_t firstBinding,
+                                                  uint32_t bindingCount,
+                                                  const VkBuffer *pBuffers,
+                                                  const VkDeviceSize *pOffsets)
+{
+    resolve_device();
+    resolve_copyfns();
+    for (uint32_t i = 0; i < bindingCount; i++)
+        if (pOffsets[i])
+            LOG("vertex binding %u offset=%llu", firstBinding + i,
+                (unsigned long long)pOffsets[i]);
+    if (real_CmdBindVertexBuffers)
+        real_CmdBindVertexBuffers(cb, firstBinding, bindingCount, pBuffers, pOffsets);
+}
+
+static PFN_vkGetImageSubresourceLayout real_GetImageSubresourceLayout;
+static VkResult VKAPI_CALL wrapped_GetImageSubresourceLayout(
+    VkDevice device, VkImage image, const VkImageSubresource *pSubresource,
+    VkSubresourceLayout *pLayout)
+{
+    resolve_device();
+    resolve_copyfns();
+    static int dbgN;
+    if (++dbgN <= 5)
+        LOG("GetImageSubresourceLayout #%d image=%p mip=%u layer=%u",
+            dbgN, (void *)image, pSubresource ? pSubresource->mipLevel : 0,
+            pSubresource ? pSubresource->arrayLayer : 0);
+    if (!real_GetImageSubresourceLayout)
+        real_GetImageSubresourceLayout =
+            (PFN_vkGetImageSubresourceLayout)(next_gdpa ? next_gdpa(g_dev, "vkGetImageSubresourceLayout") : NULL);
+    if (real_GetImageSubresourceLayout)
+        real_GetImageSubresourceLayout(device, image, pSubresource, pLayout);
+    else if (pLayout)
+        memset(pLayout, 0, sizeof(*pLayout));
+    return VK_SUCCESS;
+}
+
 static void VKAPI_CALL wrapped_DestroyDeviceHook(VkDevice device,
                                                  const VkAllocationCallbacks *a)
 {
@@ -2451,8 +2533,9 @@ static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     const VkImageCreateInfo *ci = pCreateInfo;
     VkImageCreateInfo patched;
+    const char *nlin = getenv("VKC_NO_LINEAR_OPTIMAL");
     if (pCreateInfo && pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
-        (pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        (pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !(nlin && nlin[0] == '1')) {
         patched = *pCreateInfo;
         patched.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci = &patched;
@@ -2467,6 +2550,27 @@ static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
             pCreateInfo->extent.height, (int)pCreateInfo->format, pCreateInfo->mipLevels,
             pCreateInfo->arrayLayers, (int)pCreateInfo->samples, (int)pCreateInfo->tiling,
             pCreateInfo->usage);
+    return r;
+}
+
+static VkBufferCreateInfo g_bufs[65536];
+static VkBuffer g_bufh[65536];
+static int g_nbufs;
+static VkResult VKAPI_CALL wrapped_CreateBuffer(VkDevice device,
+                                               const VkBufferCreateInfo *pCreateInfo,
+                                               const VkAllocationCallbacks *pAllocator,
+                                               VkBuffer *pBuffer)
+{
+    resolve_device();
+    resolve_copyfns();
+    VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+    if (real_CreateBufferH)
+        r = real_CreateBufferH(device, pCreateInfo, pAllocator, pBuffer);
+    if (r == VK_SUCCESS && pBuffer && pCreateInfo && g_nbufs < 65536) {
+        g_bufs[g_nbufs] = *pCreateInfo;
+        g_bufh[g_nbufs] = *pBuffer;
+        g_nbufs++;
+    }
     return r;
 }
 
@@ -2537,6 +2641,12 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
                                                        const VkWriteDescriptorSet *pDescriptorWrites)
 {
     resolve_device();
+    { static unsigned counts[512] = {0};
+      if (descriptorWriteCount < 512) counts[descriptorWriteCount]++; }
+    if (getenv("VKC_DUMP_RT") && g_atlas_dbg && g_atlas_ptr && !g_rt_big_done && descriptorWriteCount > 64) {
+        g_rt_big_done = 1;
+        LOG("RT: push with count=%u > 64!", descriptorWriteCount);
+    }
     VkWriteDescriptorSet w[64];
     VkDescriptorBufferInfo infos[64];
     VkBufferView views[64];
@@ -2545,10 +2655,111 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
         memset(infos, 0, sizeof(infos));
         memset(views, 0, sizeof(views));
         rewrite_texel_buffers(w, descriptorWriteCount, infos, views);
+        for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+            if (w[i].pBufferInfo && (w[i].pBufferInfo->offset || w[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER))
+                LOG("push desc: binding=%u type=%d offset=%llu range=%llu",
+                    w[i].dstBinding, (int)w[i].descriptorType,
+                    (unsigned long long)w[i].pBufferInfo->offset,
+                    (unsigned long long)w[i].pBufferInfo->range);
+            { static int dbg0; if (!dbg0++) LOG("push wrapper hit, first count=%u", descriptorWriteCount); }
+            if ((g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
+                static int dumpn;
+                if (++dumpn % 2000 == 0) {
+                    FILE *f = fopen("/tmp/atlas.ppm", "wb");
+                    if (f) {
+                        fprintf(f, "P6\n1024 1024\n255\n");
+                        for (int y = 1023; y >= 0; y--)
+                            fwrite(g_atlas_ptr + (size_t)y * 1024 * 4, 1, 1024 * 3, f);
+                        fclose(f);
+                    }
+                    LOG("DUMPING atlas.ppm (at push)");
+                }
+            }
+            if (getenv("VKC_DUMP_UBO") && g_atlas_dbg && g_atlas_ptr && !g_ubo_done &&
+                w[i].pBufferInfo && w[i].pBufferInfo->offset != 0 &&
+                w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                PFN_vkCmdCopyBuffer rq5 =
+                    (PFN_vkCmdCopyBuffer)next_gdpa(g_dev, "vkCmdCopyBuffer");
+                VkBufferCopy bc = {0};
+                bc.srcOffset = w[i].pBufferInfo->offset;
+                bc.dstOffset = 0;
+                bc.size = 64;
+                rq5(commandBuffer, w[i].pBufferInfo->buffer, g_atlas_dbg, 1, &bc);
+                /* also byte 0 at +64 */
+                bc.srcOffset = 0;
+                bc.dstOffset = 64;
+                bc.size = 64;
+                rq5(commandBuffer, w[i].pBufferInfo->buffer, g_atlas_dbg, 1, &bc);
+                g_ubo_done = 1;
+                LOG("ubo readback recorded: binding=%u offset=%llu", w[i].dstBinding,
+                    (unsigned long long)w[i].pBufferInfo->offset);
+                g_atlas_done = 1;
+            }
+            if (w[i].pImageInfo)
+                LOG("push img: binding=%u type=%d view=%p sampler=%p layout=%d",
+                    w[i].dstBinding, (int)w[i].descriptorType,
+                    (void *)w[i].pImageInfo->imageView,
+                    (void *)w[i].pImageInfo->sampler,
+                    (int)w[i].pImageInfo->imageLayout);
+            if (getenv("VKC_DUMP_RT") && g_atlas_dbg && g_atlas_ptr && !g_rt_done &&
+                w[i].pImageInfo &&
+                w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                w[i].pImageInfo->imageLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                extern void *vimg(void *view);
+                void *_img0 = vimg((void *)w[i].pImageInfo->imageView);
+                static int rtcount;
+                if (_img0 && ++rtcount <= 4 && !cs_in_pass(commandBuffer)) {
+                /* First sampled read of a render target: read it back.
+                 * We need the image handle: image views created with
+                 * VKC_LOG_IMAGES printed "image view %p: image=%p..." ; here
+                 * we approximate by capturing the view directly. */
+                extern void *vimg(void *view);
+                void *img = vimg((void *)w[i].pImageInfo->imageView);
+                if (img && !cs_in_pass(commandBuffer)) {
+                    VkImage imgh = (VkImage)img;
+                    PFN_vkCmdPipelineBarrier rq3 =
+                        (PFN_vkCmdPipelineBarrier)next_gdpa(g_dev, "vkCmdPipelineBarrier");
+                    VkImageMemoryBarrier b = {0};
+                    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    b.image = imgh;
+                    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    b.subresourceRange.levelCount = 1;
+                    b.subresourceRange.layerCount = 1;
+                    rq3(commandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+                    VkBufferImageCopy rb = {0};
+                    rb.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    rb.imageSubresource.layerCount = 1;
+                    rb.imageExtent.width = 1024;
+                    rb.imageExtent.height = 1024;
+                    rb.imageExtent.depth = 1;
+                    PFN_vkCmdCopyImageToBuffer rq4 =
+                        (PFN_vkCmdCopyImageToBuffer)next_gdpa(g_dev, "vkCmdCopyImageToBuffer");
+                    rq4(commandBuffer, imgh, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_atlas_dbg, 1, &rb);
+                    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    rq3(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+                    g_rt_done = 1;
+                    LOG("rt readback recorded from view %p image %p",
+                        (void *)w[i].pImageInfo->imageView, img);
+                }
+            }
+        }
     }
-    if (real_CmdPushDescriptorSetKHR)
+    if (real_CmdPushDescriptorSetKHR) {
+        const VkWriteDescriptorSet *pass = (descriptorWriteCount <= 64 && pDescriptorWrites)
+            ? w : pDescriptorWrites;
         real_CmdPushDescriptorSetKHR(commandBuffer, pipelineBindPoint, layout, set,
-                                     descriptorWriteCount, w);
+                                     descriptorWriteCount, pass);
+    }
+    }
 }
 
 static void VKAPI_CALL wrapped_UpdateDescriptorSets(VkDevice device,
@@ -2560,11 +2771,17 @@ static void VKAPI_CALL wrapped_UpdateDescriptorSets(VkDevice device,
     resolve_device();
     for (uint32_t i = 0; i < descriptorWriteCount; i++) {
         const VkWriteDescriptorSet *w = &pDescriptorWrites[i];
-        LOG("descriptor write: set=%u binding=%u array=%u count=%u type=%d image=%p sampler=%p bufview=%p",
-            w->dstSet, w->dstBinding, w->dstArrayElement, w->descriptorCount,
-            (int)w->descriptorType, (void *)w->pImageInfo,
-            w->pImageInfo ? (void *)w->pImageInfo->sampler : NULL,
-            (void *)w->pBufferInfo);
+        if (getenv("VKC_LOG_IMAGES"))
+            LOG("descriptor write: set=%u binding=%u array=%u count=%u type=%d image=%p sampler=%p bufview=%p",
+                w->dstSet, w->dstBinding, w->dstArrayElement, w->descriptorCount,
+                (int)w->descriptorType, (void *)w->pImageInfo,
+                w->pImageInfo ? (void *)w->pImageInfo->sampler : NULL,
+                (void *)w->pBufferInfo);
+        if (w->pBufferInfo && (w->pBufferInfo->offset || w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER))
+            LOG("descriptor buf: binding=%u type=%d offset=%llu range=%llu",
+                w->dstBinding, (int)w->descriptorType,
+                (unsigned long long)w->pBufferInfo->offset,
+                (unsigned long long)w->pBufferInfo->range);
     }
     VkWriteDescriptorSet w[64];
     VkDescriptorBufferInfo infos[64];
@@ -2707,6 +2924,10 @@ static PFN_vkVoidFunction intercept(const char *name)
         return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPassTracking;
     if (strcmp(name, "vkCmdEndRenderPass") == 0)
         return (PFN_vkVoidFunction)wrapped_CmdEndRenderPassTracking;
+    if (strcmp(name, "vkCmdBindVertexBuffers") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdBindVertexBuffers;
+    if (strcmp(name, "vkGetImageSubresourceLayout") == 0)
+        return (PFN_vkVoidFunction)wrapped_GetImageSubresourceLayout;
     if (strcmp(name, "vkCmdBeginRenderPass2") == 0)
         return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPass2Tracking;
     if (strcmp(name, "vkCmdEndRenderPass2") == 0)
@@ -2984,8 +3205,13 @@ void *atlas_worker(void *arg)
     LOG("atlas: get requirements...");
     rq(g_dev, g_atlas_dbg, &mr);
     LOG("atlas: got requirements");
-    PFN_vkGetPhysicalDeviceMemoryProperties rmp =
-        (PFN_vkGetPhysicalDeviceMemoryProperties)(next_gipa ? next_gipa(layer_instance, "vkGetPhysicalDeviceMemoryProperties") : NULL);
+    PFN_vkGetPhysicalDeviceMemoryProperties rmp = NULL;
+    if (next_gipa && layer_instance)
+        rmp = (PFN_vkGetPhysicalDeviceMemoryProperties)next_gipa(layer_instance, "vkGetPhysicalDeviceMemoryProperties");
+    if (!rmp)
+        rmp = (PFN_vkGetPhysicalDeviceMemoryProperties)(g_drv_gipa ? g_drv_gipa(layer_instance, "vkGetPhysicalDeviceMemoryProperties") : NULL);
+    if (!rmp)
+        rmp = (PFN_vkGetPhysicalDeviceMemoryProperties)next_gdpa(g_dev, "vkGetPhysicalDeviceMemoryProperties");
     VkPhysicalDeviceMemoryProperties mp = {0};
     LOG("atlas: get phys props...");
     rmp(g_pd, &mp);
@@ -3001,7 +3227,8 @@ void *atlas_worker(void *arg)
             mai.memoryTypeIndex = ti;
             break;
         }
-    LOG("atlas: allocate...");
+    for (int i = 0; i < 40; i++) usleep(250000);
+    LOG("atlas: allocate (after early-init sleep)...");
     am(g_dev, &mai, NULL, &g_atlas_dbgmem);
     LOG("atlas: allocated");
     PFN_vkBindBufferMemory rq2 =
