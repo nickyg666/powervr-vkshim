@@ -2304,16 +2304,28 @@ static PFN_vkCmdBindVertexBuffers real_CmdBindVertexBuffers;
 static PFN_vkDestroyCommandPool real_DestroyCommandPoolH;
 static PFN_vkCmdBeginRendering real_CmdBeginRendering;
 static PFN_vkCmdEndRendering real_CmdEndRendering;
+static PFN_vkCmdPipelineBarrier real_CmdPipelineBarrier;
+static PFN_vkQueueSubmit2KHR real_QueueSubmit2KHR;
+static PFN_vkWaitSemaphores real_WaitSemaphores;
 
 static void resolve_copyfns(void)
 {
-    if (!g_dev || real_CmdCopyImage)
+    static VkDevice bound_dev;
+    if (!g_dev || (real_CmdCopyImage && bound_dev == g_dev))
         return;
+    bound_dev = g_dev;
 #define RQ(name) \
     real_##name = (PFN_vk##name)(next_gdpa ? next_gdpa(g_dev, "vk" #name) : dev_lookup("vk" #name))
     RQ(CmdCopyImage);
     RQ(CmdCopyImageToBuffer);
     RQ(CmdBlitImage);
+    RQ(CmdPipelineBarrier);
+    real_QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)(next_gdpa ? next_gdpa(g_dev, "vkQueueSubmit2KHR") : dev_lookup("vkQueueSubmit2KHR"));
+    if (!real_QueueSubmit2KHR)
+        real_QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)(next_gdpa ? next_gdpa(g_dev, "vkQueueSubmit2") : dev_lookup("vkQueueSubmit2"));
+    real_WaitSemaphores = (PFN_vkWaitSemaphores)(next_gdpa ? next_gdpa(g_dev, "vkWaitSemaphores") : dev_lookup("vkWaitSemaphores"));
+    if (!real_WaitSemaphores)
+        real_WaitSemaphores = (PFN_vkWaitSemaphores)(next_gdpa ? next_gdpa(g_dev, "vkWaitSemaphoresKHR") : dev_lookup("vkWaitSemaphoresKHR"));
     RQ(CmdCopyBufferToImage2);
     if (!real_CmdCopyBufferToImage2 && next_gdpa)
         real_CmdCopyBufferToImage2 = (PFN_vkCmdCopyBufferToImage2)next_gdpa(g_dev, "vkCmdCopyBufferToImage2KHR");
@@ -2380,6 +2392,24 @@ static void VKAPI_CALL wrapped_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
         real_CmdCopyImageToBuffer(cb, src, sl, dst, n, r);
 }
 
+static void emit_blit_barrier(VkCommandBuffer cb)
+{
+    if (!real_CmdPipelineBarrier || cs_in_pass(cb))
+        return;
+    VkMemoryBarrier mb = {0};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_WRITE_BIT |
+                       VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT |
+                       VK_ACCESS_TRANSFER_WRITE_BIT |
+                       VK_ACCESS_MEMORY_READ_BIT;
+    real_CmdPipelineBarrier(cb,
+                            VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, 1, &mb, 0, NULL, 0, NULL);
+}
+
 static void VKAPI_CALL wrapped_CmdBlitImage(VkCommandBuffer cb, VkImage src,
                                             VkImageLayout sl, VkImage dst,
                                             VkImageLayout dl, uint32_t n,
@@ -2387,8 +2417,14 @@ static void VKAPI_CALL wrapped_CmdBlitImage(VkCommandBuffer cb, VkImage src,
 {
     resolve_device();
     resolve_copyfns();
-    if (cs_route_blit(cb, src, sl, dst, dl, n, r, f))
+    static int blit_copysec = -1;
+    if (blit_copysec < 0) {
+        const char *e = getenv("VKC_BLIT_COPYSEC");
+        blit_copysec = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (blit_copysec && cs_route_blit(cb, src, sl, dst, dl, n, r, f))
         return;
+    emit_blit_barrier(cb);
     if (real_CmdBlitImage)
         real_CmdBlitImage(cb, src, sl, dst, dl, n, r, f);
 }
@@ -2435,10 +2471,16 @@ static void VKAPI_CALL wrapped_CmdBlitImage2(VkCommandBuffer cb,
 {
     resolve_device();
     resolve_copyfns();
-    if (i && cs_route_blit2(cb, i->srcImage, i->srcImageLayout, i->dstImage,
+    static int blit_copysec = -1;
+    if (blit_copysec < 0) {
+        const char *e = getenv("VKC_BLIT_COPYSEC");
+        blit_copysec = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (blit_copysec && i && cs_route_blit2(cb, i->srcImage, i->srcImageLayout, i->dstImage,
                             i->dstImageLayout, i->regionCount, i->pRegions,
                             i->filter))
         return;
+    emit_blit_barrier(cb);
     if (real_CmdBlitImage2)
         real_CmdBlitImage2(cb, i);
 }
@@ -2899,6 +2941,95 @@ static VkResult VKAPI_CALL wrapped_QueuePresentKHR(VkQueue queue, const VkPresen
     return r;
 }
 
+static VkResult VKAPI_CALL wrapped_QueueSubmit2KHR(VkQueue queue,
+                                                   uint32_t submitCount,
+                                                   const VkSubmitInfo2 *pSubmits,
+                                                   VkFence fence)
+{
+    resolve_device();
+    resolve_copyfns();
+    if (!real_QueueSubmit2KHR)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    static int sync_submit = -1;
+    if (sync_submit < 0) {
+        const char *e = getenv("VKC_NO_SYNC_SUBMIT");
+        sync_submit = (e && e[0] == '1') ? 0 : 1;
+    }
+
+    if (sync_submit && pSubmits && submitCount > 0) {
+        /*
+         * Wait for the previous frame's timeline semaphore (value - 1) BEFORE
+         * submitting the new frame so Frame N does not clear the single shared
+         * mainRenderTarget while Frame N-1 is still rendering or blitting it.
+         */
+        if (real_WaitSemaphores && g_dev) {
+            for (uint32_t i = 0; i < submitCount; i++) {
+                for (uint32_t j = 0; j < pSubmits[i].signalSemaphoreInfoCount; j++) {
+                    const VkSemaphoreSubmitInfo *si = &pSubmits[i].pSignalSemaphoreInfos[j];
+                    if (si->semaphore && si->value >= 2) {
+                        uint64_t prev_val = si->value - 1;
+                        VkSemaphoreWaitInfo wi = {0};
+                        wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+                        wi.semaphoreCount = 1;
+                        wi.pSemaphores = &si->semaphore;
+                        wi.pValues = &prev_val;
+                        real_WaitSemaphores(g_dev, &wi, 5000000000ULL);
+                    }
+                }
+            }
+        }
+
+        /*
+         * When VulkanQueue$Submission splits mainRenderCmdBuf (submits[0]) and
+         * blitCmdBuf (submits[1]) into separate VkSubmitInfo2 entries without
+         * intermediate semaphore signals, merge them into a single VkSubmitInfo2
+         * so PowerVR's 3D and Transfer engines serialize them in one submission.
+         */
+        if (submitCount > 1 && submitCount <= 8) {
+            uint32_t nw = 0, nc = 0, ns = 0;
+            VkSubmitFlags flags = 0;
+            int can_merge = 1;
+            for (uint32_t i = 0; i < submitCount; i++) {
+                if (pSubmits[i].pNext != NULL)
+                    can_merge = 0;
+                if (i + 1 < submitCount && pSubmits[i].signalSemaphoreInfoCount > 0)
+                    can_merge = 0;
+                nw += pSubmits[i].waitSemaphoreInfoCount;
+                nc += pSubmits[i].commandBufferInfoCount;
+                ns += pSubmits[i].signalSemaphoreInfoCount;
+                flags |= pSubmits[i].flags;
+            }
+            if (can_merge && nw <= 16 && nc <= 32 && ns <= 16) {
+                VkSemaphoreSubmitInfo waits[16];
+                VkCommandBufferSubmitInfo cbs[32];
+                VkSemaphoreSubmitInfo sigs[16];
+                uint32_t wi = 0, ci = 0, si = 0;
+                for (uint32_t i = 0; i < submitCount; i++) {
+                    for (uint32_t j = 0; j < pSubmits[i].waitSemaphoreInfoCount; j++)
+                        waits[wi++] = pSubmits[i].pWaitSemaphoreInfos[j];
+                    for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++)
+                        cbs[ci++] = pSubmits[i].pCommandBufferInfos[j];
+                    for (uint32_t j = 0; j < pSubmits[i].signalSemaphoreInfoCount; j++)
+                        sigs[si++] = pSubmits[i].pSignalSemaphoreInfos[j];
+                }
+                VkSubmitInfo2 merged = {0};
+                merged.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+                merged.flags = flags;
+                merged.waitSemaphoreInfoCount = wi;
+                merged.pWaitSemaphoreInfos = wi ? waits : NULL;
+                merged.commandBufferInfoCount = ci;
+                merged.pCommandBufferInfos = ci ? cbs : NULL;
+                merged.signalSemaphoreInfoCount = si;
+                merged.pSignalSemaphoreInfos = si ? sigs : NULL;
+                return real_QueueSubmit2KHR(queue, 1, &merged, fence);
+            }
+        }
+    }
+
+    return real_QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
+}
+
 /* ------------------------------------------------------------------ */
 /* dispatch interception                                               */
 /* ------------------------------------------------------------------ */
@@ -2964,6 +3095,9 @@ static PFN_vkVoidFunction intercept(const char *name)
     if (strcmp(name, "vkCmdPushDescriptorSetKHR") == 0 ||
         strcmp(name, "vkCmdPushDescriptorSet") == 0)
         return (PFN_vkVoidFunction)wrapped_CmdPushDescriptorSetKHR;
+    if (strcmp(name, "vkQueueSubmit2KHR") == 0 ||
+        strcmp(name, "vkQueueSubmit2") == 0)
+        return (PFN_vkVoidFunction)wrapped_QueueSubmit2KHR;
     if (want_linear_optimal() && strcmp(name, "vkCreateImage") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateImage;
     if (want_copysec()) {
