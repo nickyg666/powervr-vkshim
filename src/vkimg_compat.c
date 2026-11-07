@@ -39,6 +39,8 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <link.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -46,12 +48,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <time.h>
 
 #include "minimal_fs.h"
 #include "pvr_spirv_descriptors.h"
@@ -391,6 +393,7 @@ static void resolve_device(void)
     if (!g_dev)
         return;
     if (next_gdpa) {
+        real_DestroyDevice = (PFN_vkDestroyDevice)next_gdpa(g_dev, "vkDestroyDevice");
         real_CreateShaderModule = (PFN_vkCreateShaderModule)next_gdpa(g_dev, "vkCreateShaderModule");
         real_DestroyShaderModule = (PFN_vkDestroyShaderModule)next_gdpa(g_dev, "vkDestroyShaderModule");
         real_CreateGraphicsPipelines =
@@ -406,6 +409,9 @@ static void resolve_device(void)
         real_CreateBufferView = (PFN_vkCreateBufferView)next_gdpa(g_dev, "vkCreateBufferView");
         real_CmdPushDescriptorSetKHR =
             (PFN_vkCmdPushDescriptorSetKHR)next_gdpa(g_dev, "vkCmdPushDescriptorSetKHR");
+        if (!real_CmdPushDescriptorSetKHR)
+            real_CmdPushDescriptorSetKHR =
+                (PFN_vkCmdPushDescriptorSetKHR)next_gdpa(g_dev, "vkCmdPushDescriptorSet");
         real_CreateImage = (PFN_vkCreateImage)next_gdpa(g_dev, "vkCreateImage");
         real_CmdCopyBufferToImage =
             (PFN_vkCmdCopyBufferToImage)next_gdpa(g_dev, "vkCmdCopyBufferToImage");
@@ -419,6 +425,7 @@ static void resolve_device(void)
     }
 #endif
     if (next_gdpa && g_dev) {
+        real_DestroyDevice = (PFN_vkDestroyDevice)next_gdpa(g_dev, "vkDestroyDevice");
         real_CreateShaderModule = (PFN_vkCreateShaderModule)next_gdpa(g_dev, "vkCreateShaderModule");
         real_DestroyShaderModule = (PFN_vkDestroyShaderModule)next_gdpa(g_dev, "vkDestroyShaderModule");
         real_CreateGraphicsPipelines =
@@ -668,7 +675,7 @@ static uint32_t *spv_rewrite(const uint32_t *in, size_t nwords, int strip_debug,
 
     memset(stats, 0, sizeof(*stats));
 
-    if (drop_fdepth) {
+    if (drop_fdepth || kill_to_ret) {
         size_t i = 5; /* skip the 5 word SPIR-V header */
         while (i < nwords) {
             uint32_t word = in[i];
@@ -686,29 +693,30 @@ static uint32_t *spv_rewrite(const uint32_t *in, size_t nwords, int strip_debug,
     }
 
     /*
-     * The driver does not implement OpKill (discard).  Rewriting it to an
-     * early OpReturn leaves the fragment output *undefined* (the driver then
-     * renders garbage), and branching to the merge block of the surrounding
-     * selection makes the driver's shader compiler produce garbage as well.
+     * The driver does not implement OpKill (discard) in some MRT/OIT shaders.
+     * Rewriting it to a bare OpReturn leaves the fragment outputs *undefined*
+     * (the driver then renders register garbage — e.g. flashing sky in OIT
+     * transmittance passes where the output is `vec4 coeff[2]`).
      *
-     * What works: write a fully transparent colour to the fragment output and
-     * return.  With alpha blending that is exactly what a discard does.
-     *
-     * So we need the fragment output variable and a zero constant of its type.
+     * What works: emit OpConstantNull (opcode 46) for every non-FragDepth
+     * SC_OUTPUT variable's type (works for OpTypeVector, OpTypeArray, etc.)
+     * and OpStore that null constant into each output variable before OpReturn.
      */
-    uint32_t out_var = 0, out_type = 0, out_comp = 0, out_count = 0, zero_comp = 0;
+    uint32_t out_vars[8], out_types[8], null_ids[8];
+    int n_outs = 0;
     if (kill_to_ret) {
         size_t i = 5;
-        while (i < nwords) {
+        while (i < nwords && n_outs < 8) {
             uint32_t word = in[i];
             uint32_t op = word & 0xffffu;
             uint32_t len = word >> 16;
             if (!len || i + len > nwords)
                 break;
-            if (op == OP_VARIABLE && len >= 4 && in[i + 3] == SC_OUTPUT) {
-                out_var = in[i + 2];
-                /* the variable's type is an OpTypePointer */
+            if (op == OP_VARIABLE && len >= 4 && in[i + 3] == SC_OUTPUT &&
+                in[i + 2] != fragdepth_var) {
+                uint32_t v = in[i + 2];
                 uint32_t ptr = in[i + 1];
+                uint32_t otype = 0;
                 size_t j = 5;
                 while (j < nwords) {
                     uint32_t w2 = in[j];
@@ -717,55 +725,25 @@ static uint32_t *spv_rewrite(const uint32_t *in, size_t nwords, int strip_debug,
                     if (!l2 || j + l2 > nwords)
                         break;
                     if (o2 == OP_TYPE_POINTER && l2 >= 4 && in[j + 1] == ptr) {
-                        out_type = in[j + 3];
+                        otype = in[j + 3];
                         break;
                     }
                     j += l2;
                 }
-                break;
+                if (otype) {
+                    out_vars[n_outs] = v;
+                    out_types[n_outs] = otype;
+                    null_ids[n_outs] = 0;
+                    n_outs++;
+                }
             }
             i += len;
-        }
-        /* the output type has to be a vector of scalars */
-        if (out_type) {
-            size_t j = 5;
-            while (j < nwords) {
-                uint32_t w2 = in[j];
-                uint32_t o2 = w2 & 0xffffu;
-                uint32_t l2 = w2 >> 16;
-                if (!l2 || j + l2 > nwords)
-                    break;
-                if (o2 == OP_TYPE_VECTOR && l2 >= 4 && in[j + 1] == out_type) {
-                    out_comp = in[j + 2];
-                    out_count = in[j + 3];
-                    break;
-                }
-                j += l2;
-            }
-        }
-        /* a zero constant of the component type */
-        if (out_comp) {
-            size_t j = 5;
-            while (j < nwords) {
-                uint32_t w2 = in[j];
-                uint32_t o2 = w2 & 0xffffu;
-                uint32_t l2 = w2 >> 16;
-                if (!l2 || j + l2 > nwords)
-                    break;
-                if (o2 == OP_CONSTANT && l2 >= 4 && in[j + 1] == out_comp && in[j + 3] == 0) {
-                    zero_comp = in[j + 2];
-                    break;
-                }
-                j += l2;
-            }
         }
     }
 
     uint32_t new_bound = (nwords >= 5) ? in[3] : 1;
-    uint32_t zero_vec = 0;
-    int have_zero_vec = 0;
 
-    size_t cap = nwords + 64;
+    size_t cap = nwords + 128;
     uint32_t *out = malloc(cap * 4);
     if (!out)
         return NULL;
@@ -819,11 +797,10 @@ static uint32_t *spv_rewrite(const uint32_t *in, size_t nwords, int strip_debug,
             skip = 1;
         }
 
-        /* the zero constant for the fragment output goes into the constants */
-        if (!inserted_const && op == OP_FUNCTION && out_var && out_type && out_comp &&
-            zero_comp && out_count > 0 && out_count <= 4) {
-            if (o + 3 + out_count + 4 > cap) {
-                cap = (o + 2 + out_count + 4) * 2;
+        /* emit OpConstantNull (opcode 46) for each fragment output type */
+        if (!inserted_const && op == OP_FUNCTION && n_outs > 0) {
+            if (o + (size_t)n_outs * 3 + 8 > cap) {
+                cap = (o + (size_t)n_outs * 3 + 8) * 2;
                 uint32_t *tmp = realloc(out, cap * 4);
                 if (!tmp) {
                     free(out);
@@ -831,15 +808,14 @@ static uint32_t *spv_rewrite(const uint32_t *in, size_t nwords, int strip_debug,
                 }
                 out = tmp;
             }
-            zero_vec = new_bound++;
-            out[o++] = ((uint32_t)(3 + out_count) << 16) | OP_CONSTANT_COMPOSITE;
-            out[o++] = out_type;
-            out[o++] = zero_vec;
-            for (uint32_t c = 0; c < out_count; c++)
-                out[o++] = zero_comp;
+            for (int k = 0; k < n_outs; k++) {
+                null_ids[k] = new_bound++;
+                out[o++] = (3u << 16) | 46u /* OpConstantNull */;
+                out[o++] = out_types[k];
+                out[o++] = null_ids[k];
+            }
             out[3] = new_bound;
             inserted_const = 1;
-            have_zero_vec = 1;
         }
 
         if (skip) {
@@ -858,10 +834,10 @@ static uint32_t *spv_rewrite(const uint32_t *in, size_t nwords, int strip_debug,
         }
         memcpy(out + o, in + i, len * 4);
         if (kill_to_ret && op == OP_KILL) {
-            if (have_zero_vec) {
-                /* OpStore %out %zeroVec ; OpReturn */
-                if (o + 4 > cap) {
-                    cap = (o + 4) * 2;
+            if (inserted_const && n_outs > 0) {
+                /* OpStore %out_k %null_k for each output ; OpReturn */
+                if (o + (size_t)n_outs * 3 + 4 > cap) {
+                    cap = (o + (size_t)n_outs * 3 + 4) * 2;
                     uint32_t *tmp = realloc(out, cap * 4);
                     if (!tmp) {
                         free(out);
@@ -869,9 +845,11 @@ static uint32_t *spv_rewrite(const uint32_t *in, size_t nwords, int strip_debug,
                     }
                     out = tmp;
                 }
-                out[o++] = (3u << 16) | OP_STORE;
-                out[o++] = out_var;
-                out[o++] = zero_vec;
+                for (int k = 0; k < n_outs; k++) {
+                    out[o++] = (3u << 16) | OP_STORE;
+                    out[o++] = out_vars[k];
+                    out[o++] = null_ids[k];
+                }
                 out[o++] = (1u << 16) | OP_RETURN;
             } else {
                 /* no output variable found: fall back to an early return */
@@ -918,6 +896,8 @@ static void dump_pipeline_info(const VkGraphicsPipelineCreateInfo *ci)
         struct spv_entry *e;
         pthread_mutex_lock(&g_spv_mtx);
         e = spv_find(s->module);
+        if (e && !e->file[0])
+            spv_dump(e);
         pthread_mutex_unlock(&g_spv_mtx);
         LOG("    stage%u: flags=0x%x stage=0x%x module=%p name=%s src=%s spv=%s", i, s->flags,
             s->stage, (void *)s->module, s->pName ? s->pName : "(null)",
@@ -1049,6 +1029,46 @@ static void drv_unlock(void)
     pthread_mutex_unlock(&g_drv_lock);
 }
 
+static __thread sigjmp_buf g_uf_jmp;
+static __thread volatile int g_uf_in_call;
+static uintptr_t g_uf_base;
+
+static void caught_uf_out_of_range(const char *msg)
+{
+    void *bt[16];
+    int cnt = backtrace(bt, 16);
+    LOG("caught libufwriter std::out_of_range(%s) base=0x%lx",
+        msg ? msg : "?", (unsigned long)g_uf_base);
+    for (int i = 0; i < cnt && i < 8; i++) {
+        uintptr_t a = (uintptr_t)bt[i];
+        if (g_uf_base && a >= g_uf_base)
+            LOG("  bt[%d]: %p (uf+0x%lx)", i, bt[i], (unsigned long)(a - g_uf_base));
+        else
+            LOG("  bt[%d]: %p", i, bt[i]);
+    }
+    if (g_uf_in_call) {
+        g_uf_in_call = 0;
+        siglongjmp(g_uf_jmp, 1);
+    }
+    abort();
+}
+
+static int uf_phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size;
+    (void)data;
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libufwriter.so"))
+        return 0;
+    g_uf_base = (uintptr_t)info->dlpi_addr;
+    uintptr_t got_page = (g_uf_base + 0x2fd6000ULL) & ~4095ULL;
+    if (mprotect((void *)got_page, 8192, PROT_READ | PROT_WRITE) == 0) {
+        *(void **)(g_uf_base + 0x2fd6470ULL) = (void *)caught_uf_out_of_range;
+        *(void **)(g_uf_base + 0x2fd6028ULL) = (void *)caught_uf_out_of_range;
+        DBG("hooked libufwriter.so out_of_range GOT at base=0x%lx", (unsigned long)g_uf_base);
+    }
+    return 1;
+}
+
 /*
  * Repairs that are known to work for a given shader.  The PowerVR pipeline
  * compiler rejects several perfectly legal pipeline configurations, and the
@@ -1143,13 +1163,13 @@ static void remember_layout(VkPipelineLayout h, const VkPipelineLayoutCreateInfo
 }
 
 
-/* The OIT state fix can be disabled with VKC_OIT_FIX=0 for testing. */
+/* The OIT state fix is opt-in (VKC_OIT_FIX=1); default OFF. */
 static int oit_fix_enabled(void)
 {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("VKC_OIT_FIX");
-        cached = (e && e[0] == '0') ? 0 : 1;
+        cached = (e && e[0] == '1') ? 1 : 0;
     }
     return cached;
 }
@@ -1234,19 +1254,12 @@ static VkResult VKAPI_CALL wrapped_CreateInstance(const VkInstanceCreateInfo *pC
                                                   VkInstance *pInstance)
 {
 #ifdef AS_LAYER
-    /*
-     * Chain to the next layer.  The loader hands us
-     *  - a VK_LAYER_LINK_INFO struct whose u.pLayerInfo points at the next
-     *    layer's entry points, and
-     *  - a VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK struct with the callback
-     *    that has to be used to create the device.
-     */
     {
         const VkLayerInstanceCreateInfo *link =
             find_instance_info(pCreateInfo->pNext, VK_LAYER_LINK_INFO);
         if (link && link->u.pLayerInfo) {
             next_gipa = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-            LOG("layer: next gipa=%p", (void *)next_gipa);
+            DBG("layer: next gipa=%p", (void *)next_gipa);
         }
         const VkLayerInstanceCreateInfo *cb = find_instance_info(
             pCreateInfo->pNext, VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK);
@@ -1254,6 +1267,7 @@ static VkResult VKAPI_CALL wrapped_CreateInstance(const VkInstanceCreateInfo *pC
             next_layer_create_device = cb->u.layerDevice.pfnLayerCreateDevice;
     }
 #endif
+    real_CreateInstance = NULL;
     resolve_global();
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (real_CreateInstance)
@@ -1261,9 +1275,13 @@ static VkResult VKAPI_CALL wrapped_CreateInstance(const VkInstanceCreateInfo *pC
     if (r == VK_SUCCESS && pInstance) {
         g_inst = *pInstance;
         layer_instance = *pInstance;
+#ifdef AS_LAYER
+        if (next_gipa)
+            real_DestroyInstance = (PFN_vkDestroyInstance)next_gipa(g_inst, "vkDestroyInstance");
+#endif
         resolve_device();
     }
-    LOG("CreateInstance r=%d instance=%p", r, (void *)(pInstance ? *pInstance : NULL));
+    DBG("CreateInstance r=%d instance=%p", r, (void *)(pInstance ? *pInstance : NULL));
     return r;
 }
 
@@ -1272,8 +1290,11 @@ static void VKAPI_CALL wrapped_DestroyInstance(VkInstance instance,
 {
     if (real_DestroyInstance)
         real_DestroyInstance(instance, pAllocator);
-    g_inst = VK_NULL_HANDLE;
+    if (g_inst == instance)
+        g_inst = VK_NULL_HANDLE;
 }
+
+static void resolve_copyfns(void);
 
 static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
                                                 const VkDeviceCreateInfo *pCreateInfo,
@@ -1281,25 +1302,14 @@ static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
                                                 VkDevice *pDevice)
 {
 #ifdef AS_LAYER
-    /*
-     * The device chain link tells us the entry point of the next layer.  We
-     * need it *before* the device is created, because the loader fills the
-     * device dispatch table through our own vkGetDeviceProcAddr while the
-     * device is being created.
-     */
     {
         const VkLayerDeviceCreateInfo *link =
             find_device_info(pCreateInfo->pNext, VK_LAYER_LINK_INFO);
         if (link && link->u.pLayerInfo) {
             next_gdpa = link->u.pLayerInfo->pfnNextGetDeviceProcAddr;
-            LOG("layer: next device gdpa=%p", (void *)next_gdpa);
+            DBG("layer: next device gdpa=%p", (void *)next_gdpa);
         }
     }
-    /*
-     * The loader provides a callback that creates the device through the
-     * layer chain and fills the device dispatch table - using it is what makes
-     * the loader route the device level calls through this layer.
-     */
     g_pd = physicalDevice;
     if (next_gipa) {
         PFN_vkCreateDevice next_create =
@@ -1307,16 +1317,20 @@ static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
                                            "vkCreateDevice");
         if (next_create) {
             VkResult res = next_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
-            if (res == VK_SUCCESS && pDevice && *pDevice)
+            if (res == VK_SUCCESS && pDevice && *pDevice) {
                 g_dev = *pDevice;
+                real_CreateShaderModule = NULL;
+                resolve_device();
+                if (!g_uf_base)
+                    dl_iterate_phdr(uf_phdr_cb, NULL);
+            }
             if (res == VK_SUCCESS && getenv("VKC_DUMP_ATLAS")) {
                 extern void *atlas_worker(void *);
                 pthread_t th;
                 pthread_create(&th, NULL, atlas_worker, NULL);
                 pthread_detach(th);
             }
-            resolve_device();
-            LOG("CreateDevice r=%d device=%p next_gdpa=%p", res, (void *)(pDevice ? *pDevice : NULL),
+            DBG("CreateDevice r=%d device=%p next_gdpa=%p", res, (void *)(pDevice ? *pDevice : NULL),
                 (void *)next_gdpa);
             return res;
         }
@@ -1330,7 +1344,7 @@ static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
         r = real_CreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (r == VK_SUCCESS && pDevice && *pDevice)
         g_dev = *pDevice;
-    LOG("CreateDevice r=%d device=%p", r, (void *)(pDevice ? *pDevice : NULL));
+    DBG("CreateDevice r=%d device=%p", r, (void *)(pDevice ? *pDevice : NULL));
     return r;
 }
 
@@ -1342,12 +1356,6 @@ static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
 {
     resolve_device();
 
-    /*
-     * The PowerVR pipeline compiler chokes on OpKill (discard) inside
-     * Minecraft's order independent transparency shaders and kills the whole
-     * process asynchronously.  Rewrite those shaders before the driver sees
-     * them.
-     */
     const uint32_t *code = pCreateInfo ? pCreateInfo->pCode : NULL;
     size_t words = (pCreateInfo && pCreateInfo->codeSize >= 4) ? pCreateInfo->codeSize / 4 : 0;
     int oit = code && words ? spv_is_oit(code, words) : 0;
@@ -1355,22 +1363,18 @@ static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
     size_t patched_words = 0;
     size_t tb_words = 0;
     /*
-     * The driver's pipeline compiler does not implement OpKill (discard).
-     * Every shader that uses one has to be rewritten, not just the OIT ones:
-     * the GUI text shader uses a discard as well and the driver renders
-     * garbage for the discarded fragments.
+     * Leave OpKill in place by default (rewriting plain shaders breaks GUI font
+     * rendering); failing OIT/MRT shaders are rewritten on demand in
+     * wrapped_CreateGraphicsPipelines. Set VKC_KILL_REWRITE=1 to force early rewrite.
      */
     const char *nokill = getenv("VKC_NO_KILL_REWRITE");
     const char *killmode = getenv("VKC_KILL_REWRITE");
-    if (killmode && killmode[0] == '1') {
-        /* testing: rewrite the OpKill */
-    } else if (nokill && nokill[0] == '1') {
-        /* testing: leave the OpKill in the shader */
-    } else if (code && words && spv_has_kill(code, words)) {
+    int do_kill_rewrite = (killmode && killmode[0] == '1') || (nokill && nokill[0] == '0');
+    if (do_kill_rewrite && code && words && spv_has_kill(code, words)) {
         struct spv_stats st1;
         patched = spv_rewrite(code, words, 0, 1, 0, &st1, &patched_words);
         if (patched && st1.kills) {
-            LOG("%s shader: rewriting %d OpKill -> discard (%zu -> %zu words)",
+            DBG("%s shader: rewriting %d OpKill -> discard (%zu -> %zu words)",
                 oit ? "OIT" : "plain", st1.kills, words, patched_words);
         } else {
             free(patched);
@@ -1391,16 +1395,16 @@ static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
     } else if (patched) {
         uint32_t *tb = spv_texelbuf_to_storage(patched, patched_words, &tb_words);
         if (tb) {
-            LOG("texel buffer shader: rewritten to a storage buffer (%zu -> %zu words)",
+            DBG("texel buffer shader: rewritten to a storage buffer (%zu -> %zu words)",
                 patched_words, tb_words);
             free(patched);
             patched = tb;
             patched_words = tb_words;
         }
-    } else if (code && words && !(notexel && notexel[0] == '1')) {
+    } else if (code && words) {
         uint32_t *tb = spv_texelbuf_to_storage(code, words, &tb_words);
         if (tb) {
-            LOG("texel buffer shader: rewritten to a storage buffer (%zu -> %zu words)",
+            DBG("texel buffer shader: rewritten to a storage buffer (%zu -> %zu words)",
                 words, tb_words);
             patched = tb;
             patched_words = tb_words;
@@ -1420,18 +1424,13 @@ static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
         }
     }
 
-    /*
-     * The driver computes the implicit texture LOD wrongly, so every mipmapped
-     * texture is sampled from a garbage level.  Force level 0.  This has to
-     * happen for every shader, not just the ones that needed another fix.
-     */
     if (code && words && getenv("VKC_LOD0") != NULL) {
         const uint32_t *src = patched ? patched : code;
         size_t src_words = patched ? patched_words : words;
         size_t lod_words = 0;
         uint32_t *lod = spv_force_lod0(src, src_words, &lod_words);
         if (lod) {
-            LOG("shader: forcing the texture LOD to 0 (%zu -> %zu words)", src_words, lod_words);
+            DBG("shader: forcing the texture LOD to 0 (%zu -> %zu words)", src_words, lod_words);
             free(patched);
             patched = lod;
             patched_words = lod_words;
@@ -1446,36 +1445,51 @@ static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
 
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     drv_lock();
-    if (real_CreateShaderModule)
-        r = real_CreateShaderModule(device, patched ? &ci : pCreateInfo, pAllocator, pShaderModule);
+    if (real_CreateShaderModule) {
+        if (sigsetjmp(g_uf_jmp, 1) == 0) {
+            g_uf_in_call = 1;
+            r = real_CreateShaderModule(device, patched ? &ci : pCreateInfo, pAllocator, pShaderModule);
+            g_uf_in_call = 0;
+        } else {
+            r = VK_ERROR_UNKNOWN;
+        }
+    }
     drv_unlock();
-    free(patched);
     for (int attempt = 0; attempt < g_retry && r != VK_SUCCESS; attempt++) {
         usleep(20000);
         drv_lock();
-        if (real_CreateShaderModule)
-            r = real_CreateShaderModule(device, patched ? &ci : pCreateInfo, pAllocator, pShaderModule);
+        if (real_CreateShaderModule) {
+            if (sigsetjmp(g_uf_jmp, 1) == 0) {
+                g_uf_in_call = 1;
+                r = real_CreateShaderModule(device, patched ? &ci : pCreateInfo, pAllocator, pShaderModule);
+                g_uf_in_call = 0;
+            } else {
+                r = VK_ERROR_UNKNOWN;
+            }
+        }
         drv_unlock();
         if (r == VK_SUCCESS)
-            LOG("CreateShaderModule: succeeded on retry %d", attempt + 1);
+            DBG("CreateShaderModule: succeeded on retry %d", attempt + 1);
     }
 
     if (r == VK_SUCCESS && pShaderModule && *pShaderModule && pCreateInfo && pCreateInfo->pCode &&
         pCreateInfo->codeSize >= 20) {
-        size_t words = pCreateInfo->codeSize / 4;
+        const uint32_t *save_code = patched ? patched : pCreateInfo->pCode;
+        size_t save_words = patched ? patched_words : (pCreateInfo->codeSize / 4);
         struct spv_entry *e = calloc(1, sizeof(*e));
         if (e) {
             e->mod = *pShaderModule;
-            e->words = words;
-            e->code = malloc(words * 4);
+            e->words = save_words;
+            e->code = malloc(save_words * 4);
             if (e->code) {
-                memcpy(e->code, pCreateInfo->pCode, words * 4);
-                e->stage = spv_entry_point_stage(e->code, words);
-                e->oit = spv_is_oit(e->code, words);
-                spv_source_name(e->code, words, e->src, sizeof(e->src));
+                memcpy(e->code, save_code, save_words * 4);
+                e->stage = spv_entry_point_stage(e->code, save_words);
+                e->oit = oit;
+                spv_source_name(pCreateInfo->pCode, pCreateInfo->codeSize / 4, e->src, sizeof(e->src));
                 pthread_mutex_lock(&g_spv_mtx);
                 e->seq = ++g_spv_seq;
-                spv_dump(e);
+                if (g_debug || getenv("VKC_DUMP_SPV"))
+                    spv_dump(e);
                 e->next = g_spv_head;
                 g_spv_head = e;
                 pthread_mutex_unlock(&g_spv_mtx);
@@ -1486,6 +1500,7 @@ static VkResult VKAPI_CALL wrapped_CreateShaderModule(VkDevice device,
             }
         }
     }
+    free(patched);
     if (r != VK_SUCCESS)
         LOG("CreateShaderModule FAILED r=%d", r);
     return r;
@@ -1521,7 +1536,9 @@ static VkShaderModule make_module(VkDevice device, const uint32_t *code, size_t 
     ci.codeSize = words * 4;
     ci.pCode = code;
     VkShaderModule mod = VK_NULL_HANDLE;
+    drv_lock();
     VkResult r = real_CreateShaderModule(device, &ci, NULL, &mod);
+    drv_unlock();
     if (r != VK_SUCCESS) {
         LOG("  repair: replacement CreateShaderModule failed r=%d", r);
         return VK_NULL_HANDLE;
@@ -1536,23 +1553,20 @@ static VkResult VKAPI_CALL wrapped_CreateDescriptorSetLayout(
     resolve_device();
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
 
-    /*
-     * The driver does not support UNIFORM_TEXEL_BUFFER descriptors when the
-     * shader uses a buffer image, so the descriptor becomes a storage buffer.
-     * The shader is rewritten accordingly (see wrapped_CreateShaderModule)
-     * and the descriptor write is translated in wrapped_CmdPushDescriptorSetKHR.
-     */
     VkDescriptorSetLayoutBinding lb[64];
     VkDescriptorSetLayoutCreateInfo lci;
     int patched_layout = 0;
     if (pCreateInfo && pCreateInfo->bindingCount <= 64 && pCreateInfo->pBindings) {
-        memcpy(lb, pCreateInfo->pBindings, pCreateInfo->bindingCount * sizeof(lb[0]));
-        for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
-            const char *notexel2 = getenv("VKC_NO_TEXEL");
-            if (!(notexel2 && notexel2[0] == '1') &&
-                lb[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
-                lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                patched_layout = 1;
+        const char *notexel2 = getenv("VKC_NO_TEXEL");
+        if (!(notexel2 && notexel2[0] == '1')) {
+            for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
+                if (pCreateInfo->pBindings[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+                    if (!patched_layout) {
+                        memcpy(lb, pCreateInfo->pBindings, pCreateInfo->bindingCount * sizeof(lb[0]));
+                        patched_layout = 1;
+                    }
+                    lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                }
             }
         }
     }
@@ -1561,18 +1575,20 @@ static VkResult VKAPI_CALL wrapped_CreateDescriptorSetLayout(
         lci.pBindings = lb;
         if (real_CreateDescriptorSetLayout)
             r = real_CreateDescriptorSetLayout(device, &lci, pAllocator, pSetLayout);
-        LOG("descriptor set layout: texel buffer descriptors turned into storage buffers");
+        DBG("descriptor set layout: texel buffer descriptors turned into storage buffers");
     } else if (real_CreateDescriptorSetLayout) {
         r = real_CreateDescriptorSetLayout(device, pCreateInfo, pAllocator, pSetLayout);
     }
     if (r == VK_SUCCESS && pCreateInfo) {
         if (pSetLayout)
-            remember_dsl(*pSetLayout, pCreateInfo);
-        LOG("dsl %p bindings=%u:", (void *)(pSetLayout ? *pSetLayout : NULL), pCreateInfo->bindingCount);
-        for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
-            const VkDescriptorSetLayoutBinding *b = &pCreateInfo->pBindings[i];
-            LOG("   binding=%u type=%d count=%u stages=0x%x", b->binding, b->descriptorType,
-                b->descriptorCount, b->stageFlags);
+            remember_dsl(*pSetLayout, patched_layout ? &lci : pCreateInfo);
+        if (g_debug) {
+            DBG("dsl %p bindings=%u:", (void *)(pSetLayout ? *pSetLayout : NULL), pCreateInfo->bindingCount);
+            for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
+                const VkDescriptorSetLayoutBinding *b = &pCreateInfo->pBindings[i];
+                DBG("   binding=%u type=%d count=%u stages=0x%x", b->binding, b->descriptorType,
+                    b->descriptorCount, b->stageFlags);
+            }
         }
     }
     return r;
@@ -1613,14 +1629,16 @@ static VkResult VKAPI_CALL wrapped_CreatePipelineLayout(
         r = real_CreatePipelineLayout(device, pCreateInfo, pAllocator, pPipelineLayout);
     if (r == VK_SUCCESS && pCreateInfo && pPipelineLayout) {
         remember_layout(*pPipelineLayout, pCreateInfo);
-        LOG("CreatePipelineLayout %p sets=%u pushRanges=%u", (void *)*pPipelineLayout,
-            pCreateInfo->setLayoutCount, pCreateInfo->pushConstantRangeCount);
-        for (uint32_t i = 0; i < pCreateInfo->setLayoutCount; i++)
-            LOG("   set%u dsl=%p", i, (void *)pCreateInfo->pSetLayouts[i]);
-        for (uint32_t i = 0; i < pCreateInfo->pushConstantRangeCount; i++)
-            LOG("   pcRange%u stages=0x%x offset=%u size=%u", i,
-                pCreateInfo->pPushConstantRanges[i].stageFlags,
-                pCreateInfo->pPushConstantRanges[i].offset, pCreateInfo->pPushConstantRanges[i].size);
+        if (g_debug) {
+            DBG("CreatePipelineLayout %p sets=%u pushRanges=%u", (void *)*pPipelineLayout,
+                pCreateInfo->setLayoutCount, pCreateInfo->pushConstantRangeCount);
+            for (uint32_t i = 0; i < pCreateInfo->setLayoutCount; i++)
+                DBG("   set%u dsl=%p", i, (void *)pCreateInfo->pSetLayouts[i]);
+            for (uint32_t i = 0; i < pCreateInfo->pushConstantRangeCount; i++)
+                DBG("   pcRange%u stages=0x%x offset=%u size=%u", i,
+                    pCreateInfo->pPushConstantRanges[i].stageFlags,
+                    pCreateInfo->pPushConstantRanges[i].offset, pCreateInfo->pPushConstantRanges[i].size);
+        }
     }
     return r;
 }
@@ -1644,6 +1662,7 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
      */
     VkGraphicsPipelineCreateInfo *cis = NULL;
     VkPipelineShaderStageCreateInfo (*stage_copies)[8] = NULL;
+    VkPipelineRasterizationStateCreateInfo *rs_copies = NULL;
     uint32_t nfix = 0;
     if (pCreateInfos && createInfoCount) {
         for (uint32_t i = 0; i < createInfoCount; i++) {
@@ -1651,28 +1670,27 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
             for (uint32_t st = 0; st < ci->stageCount; st++) {
                 if (ci->pStages[st].stage != VK_SHADER_STAGE_FRAGMENT_BIT)
                     continue;
-                if (fix_find(ci->pStages[st].module) || module_is_oit(ci->pStages[st].module))
+                if (fix_find(ci->pStages[st].module) ||
+                    (oit_fix_enabled() && module_is_oit(ci->pStages[st].module)))
                     nfix++;
             }
-            /*
-             * The PowerVR pipeline compiler rejects pipelines whose
-             * descriptor set layout does not match the descriptors the
-             * shaders declare.  Detect that here and use a corrected layout.
-             */
-            struct pvr_desc pd_[PVR_MAX_DESC];
-            int npd = 0;
-            for (uint32_t st = 0; st < ci->stageCount && npd < PVR_MAX_DESC; st++) {
-                struct spv_entry *se;
-                pthread_mutex_lock(&g_spv_mtx);
-                se = spv_find(ci->pStages[st].module);
-                pthread_mutex_unlock(&g_spv_mtx);
-                if (!se)
-                    continue;
-                npd += pvr_parse_descriptors(se->code, se->words, &pd_[npd], PVR_MAX_DESC - npd);
-            }
-            if (npd && ci->layout && layout_mismatches(ci->layout, pd_, npd, why, sizeof(why))) {
+            if (ci->pRasterizationState &&
+                ci->pRasterizationState->polygonMode != VK_POLYGON_MODE_FILL)
                 nfix++;
-                LOG("pipeline %u: the descriptor layout does not match the shaders (%s)", i, why);
+            if (g_debug) {
+                struct pvr_desc pd_[PVR_MAX_DESC];
+                int npd = 0;
+                for (uint32_t st = 0; st < ci->stageCount && npd < PVR_MAX_DESC; st++) {
+                    struct spv_entry *se;
+                    pthread_mutex_lock(&g_spv_mtx);
+                    se = spv_find(ci->pStages[st].module);
+                    pthread_mutex_unlock(&g_spv_mtx);
+                    if (!se)
+                        continue;
+                    npd += pvr_parse_descriptors(se->code, se->words, &pd_[npd], PVR_MAX_DESC - npd);
+                }
+                if (npd && ci->layout && layout_mismatches(ci->layout, pd_, npd, why, sizeof(why)))
+                    DBG("pipeline %u: the descriptor layout does not match the shaders (%s)", i, why);
             }
             if (getenv("VKC_DUMP_PIPELINES")) {
                 char mods[256] = "";
@@ -1694,20 +1712,21 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
     if (nfix) {
         cis = calloc(createInfoCount, sizeof(*cis));
         stage_copies = calloc(createInfoCount, sizeof(*stage_copies));
-        if (cis && stage_copies) {
+        rs_copies = calloc(createInfoCount, sizeof(*rs_copies));
+        if (cis && stage_copies && rs_copies) {
             memcpy(cis, pCreateInfos, createInfoCount * sizeof(*cis));
             for (uint32_t i = 0; i < createInfoCount; i++) {
                 const VkGraphicsPipelineCreateInfo *ci = &pCreateInfos[i];
+                if (ci->pRasterizationState &&
+                    ci->pRasterizationState->polygonMode != VK_POLYGON_MODE_FILL) {
+                    rs_copies[i] = *ci->pRasterizationState;
+                    rs_copies[i].polygonMode = VK_POLYGON_MODE_FILL;
+                    cis[i].pRasterizationState = &rs_copies[i];
+                }
                 if (ci->stageCount > 8)
                     continue;
                 memcpy(stage_copies[i], ci->pStages,
                        sizeof(VkPipelineShaderStageCreateInfo) * ci->stageCount);
-                /*
-                 * OIT passes use 32 bit float colour attachments with
-                 * blending.  The driver has neither the floatBlend feature nor
-                 * support for the MINIMUM/MAXIMUM blend operations on them,
-                 * so fall back to 16 bit float without blending.
-                 */
                 VkShaderModule oit_mod = VK_NULL_HANDLE;
                 for (uint32_t st2 = 0; st2 < ci->stageCount; st2++)
                     if (ci->pStages[st2].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
@@ -1715,7 +1734,7 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
                         break;
                     }
                 if (oit_mod != VK_NULL_HANDLE && module_is_oit(oit_mod) && oit_fix_enabled()) {
-                    LOG("  applying the OIT state fix to pipeline %u", i);
+                    DBG("  applying the OIT state fix to pipeline %u", i);
                     if (ci->pColorBlendState && ci->pColorBlendState->attachmentCount <= 8) {
                         static VkPipelineColorBlendAttachmentState att[8];
                         static VkPipelineColorBlendStateCreateInfo cb;
@@ -1758,21 +1777,6 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
                         cis[i].pDepthStencilState = &ds;
                     }
                 }
-
-                /* corrected layout when the app's layout does not match */
-                struct pvr_desc pd_[PVR_MAX_DESC];
-                int npd = 0;
-                for (uint32_t st = 0; st < ci->stageCount && npd < PVR_MAX_DESC; st++) {
-                    struct spv_entry *se;
-                    pthread_mutex_lock(&g_spv_mtx);
-                    se = spv_find(ci->pStages[st].module);
-                    pthread_mutex_unlock(&g_spv_mtx);
-                    if (!se)
-                        continue;
-                    npd += pvr_parse_descriptors(se->code, se->words, &pd_[npd], PVR_MAX_DESC - npd);
-                }
-                if (npd && ci->layout && layout_mismatches(ci->layout, pd_, npd, why, sizeof(why)))
-                    LOG("  pipeline %u: the descriptor layout does not match the shaders (%s)", i, why);
 
                 struct fix_entry *f = NULL;
                 for (uint32_t st = 0; st < ci->stageCount; st++)
@@ -1840,17 +1844,18 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
                     }
                 }
                 if (f->discard_raster && ci->pRasterizationState) {
-                    static VkPipelineRasterizationStateCreateInfo rs;
-                    rs = *ci->pRasterizationState;
-                    rs.rasterizerDiscardEnable = VK_TRUE;
-                    cis[i].pRasterizationState = &rs;
+                    rs_copies[i] = *ci->pRasterizationState;
+                    rs_copies[i].rasterizerDiscardEnable = VK_TRUE;
+                    cis[i].pRasterizationState = &rs_copies[i];
                 }
             }
         } else {
             free(cis);
             free(stage_copies);
+            free(rs_copies);
             cis = NULL;
             stage_copies = NULL;
+            rs_copies = NULL;
         }
     }
 
@@ -1858,11 +1863,20 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
         for (uint32_t i = 0; i < createInfoCount; i++)
             LOG("pipeline %u layout=%p", i, (void *)pCreateInfos[i].layout);
     drv_lock();
-    VkResult r = real_CreateGraphicsPipelines(device, pipelineCache, createInfoCount,
-                                              cis ? cis : pCreateInfos, pAllocator, pPipelines);
+    VkResult r = VK_ERROR_UNKNOWN;
+    if (sigsetjmp(g_uf_jmp, 1) == 0) {
+        g_uf_in_call = 1;
+        r = real_CreateGraphicsPipelines(device, pipelineCache, createInfoCount,
+                                         cis ? cis : pCreateInfos, pAllocator, pPipelines);
+        g_uf_in_call = 0;
+    } else {
+        LOG("vkCreateGraphicsPipelines threw out_of_range on initial attempt");
+        r = VK_ERROR_UNKNOWN;
+    }
     drv_unlock();
     free(cis);
     free(stage_copies);
+    free(rs_copies);
 
     /*
      * The PowerVR shader/pipeline compiler is non-deterministic: the very
@@ -1872,8 +1886,14 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
     for (int attempt = 0; attempt < g_retry && r != VK_SUCCESS; attempt++) {
         usleep(30000);
         drv_lock();
-        r = real_CreateGraphicsPipelines(device, pipelineCache, createInfoCount, pCreateInfos,
-                                         pAllocator, pPipelines);
+        if (sigsetjmp(g_uf_jmp, 1) == 0) {
+            g_uf_in_call = 1;
+            r = real_CreateGraphicsPipelines(device, pipelineCache, createInfoCount, pCreateInfos,
+                                             pAllocator, pPipelines);
+            g_uf_in_call = 0;
+        } else {
+            r = VK_ERROR_UNKNOWN;
+        }
         drv_unlock();
         if (r == VK_SUCCESS)
             LOG("vkCreateGraphicsPipelines: succeeded on retry %d", attempt + 1);
@@ -2046,8 +2066,14 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
             VkResult r2 = VK_ERROR_INITIALIZATION_FAILED;
             for (int attempt = 0; attempt < 4; attempt++) {
                 drv_lock();
-                r2 = real_CreateGraphicsPipelines(device, pipelineCache, 1, &tmp, pAllocator,
-                                                 &outpipe);
+                if (sigsetjmp(g_uf_jmp, 1) == 0) {
+                    g_uf_in_call = 1;
+                    r2 = real_CreateGraphicsPipelines(device, pipelineCache, 1, &tmp, pAllocator,
+                                                     &outpipe);
+                    g_uf_in_call = 0;
+                } else {
+                    r2 = VK_ERROR_UNKNOWN;
+                }
                 drv_unlock();
                 if (r2 == VK_SUCCESS)
                     break;
@@ -2074,6 +2100,9 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
                     f->add_blend_op = cand[c].add_blend_op;
                     f->fmt16 = cand[c].fmt16;
                 }
+                for (int k = 0; k < ncand; k++)
+                    if (k != c && cand[k].repl_fs && real_DestroyShaderModule)
+                        real_DestroyShaderModule(device, cand[k].repl_fs, NULL);
                 pPipelines[i] = outpipe;
                 return VK_SUCCESS;
             }
@@ -2085,6 +2114,41 @@ static VkResult VKAPI_CALL wrapped_CreateGraphicsPipelines(VkDevice device,
             if (cand[c].repl_fs && real_DestroyShaderModule)
                 real_DestroyShaderModule(device, cand[c].repl_fs, NULL);
     }
+    return r;
+}
+
+static VkResult VKAPI_CALL wrapped_CreateComputePipelines(
+    VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkComputePipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator,
+    VkPipeline *pPipelines)
+{
+    resolve_device();
+    if (!real_CreateComputePipelines)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    drv_lock();
+    VkResult r = VK_ERROR_UNKNOWN;
+    if (sigsetjmp(g_uf_jmp, 1) == 0) {
+        g_uf_in_call = 1;
+        r = real_CreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos,
+                                        pAllocator, pPipelines);
+        g_uf_in_call = 0;
+    }
+    drv_unlock();
+    for (int attempt = 0; attempt < g_retry && r != VK_SUCCESS; attempt++) {
+        usleep(20000);
+        drv_lock();
+        if (sigsetjmp(g_uf_jmp, 1) == 0) {
+            g_uf_in_call = 1;
+            r = real_CreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos,
+                                            pAllocator, pPipelines);
+            g_uf_in_call = 0;
+        }
+        drv_unlock();
+        if (r == VK_SUCCESS)
+            DBG("vkCreateComputePipelines: succeeded on retry %d", attempt + 1);
+    }
+    if (r != VK_SUCCESS)
+        LOG("vkCreateComputePipelines FAILED r=%d count=%u", r, createInfoCount);
     return r;
 }
 
@@ -2119,7 +2183,12 @@ static VkResult VKAPI_CALL wrapped_CreateSampler(VkDevice device,
 {
     resolve_device();
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
-    if (getenv("VKC_CLAMP_LOD0")) {
+    static int clamp_lod0 = -1;
+    if (clamp_lod0 < 0) {
+        const char *e = getenv("VKC_CLAMP_LOD0");
+        clamp_lod0 = (e && e[0] == '0') ? 0 : 1; /* default ON */
+    }
+    if (clamp_lod0 && pCreateInfo) {
         VkSamplerCreateInfo patched = *pCreateInfo;
         patched.minLod = 0.0f;
         patched.maxLod = 0.0f;
@@ -2232,6 +2301,10 @@ static PFN_vkCmdBeginRenderPass2 real_CmdBeginRenderPass2;
 static PFN_vkCmdEndRenderPass2 real_CmdEndRenderPass2;
 static PFN_vkCmdBindVertexBuffers real_CmdBindVertexBuffers;
 
+static PFN_vkDestroyCommandPool real_DestroyCommandPoolH;
+static PFN_vkCmdBeginRendering real_CmdBeginRendering;
+static PFN_vkCmdEndRendering real_CmdEndRendering;
+
 static void resolve_copyfns(void)
 {
     if (!g_dev || real_CmdCopyImage)
@@ -2242,27 +2315,43 @@ static void resolve_copyfns(void)
     RQ(CmdCopyImageToBuffer);
     RQ(CmdBlitImage);
     RQ(CmdCopyBufferToImage2);
+    if (!real_CmdCopyBufferToImage2 && next_gdpa)
+        real_CmdCopyBufferToImage2 = (PFN_vkCmdCopyBufferToImage2)next_gdpa(g_dev, "vkCmdCopyBufferToImage2KHR");
     RQ(CmdCopyImageToBuffer2);
+    if (!real_CmdCopyImageToBuffer2 && next_gdpa)
+        real_CmdCopyImageToBuffer2 = (PFN_vkCmdCopyImageToBuffer2)next_gdpa(g_dev, "vkCmdCopyImageToBuffer2KHR");
     RQ(CmdCopyImage2);
+    if (!real_CmdCopyImage2 && next_gdpa)
+        real_CmdCopyImage2 = (PFN_vkCmdCopyImage2)next_gdpa(g_dev, "vkCmdCopyImage2KHR");
     RQ(CmdBlitImage2);
+    if (!real_CmdBlitImage2 && next_gdpa)
+        real_CmdBlitImage2 = (PFN_vkCmdBlitImage2)next_gdpa(g_dev, "vkCmdBlitImage2KHR");
     RQ(AllocateCommandBuffers);
     RQ(FreeCommandBuffers);
     RQ(BeginCommandBuffer);
     RQ(ResetCommandBuffer);
     RQ(ResetCommandPool);
+    real_DestroyCommandPoolH = (PFN_vkDestroyCommandPool)(next_gdpa ? next_gdpa(g_dev, "vkDestroyCommandPool") : dev_lookup("vkDestroyCommandPool"));
     RQ(CmdBeginRenderPass);
     RQ(CmdEndRenderPass);
-    RQ(CmdBindVertexBuffers);
-    real_CreateBufferH = (PFN_vkCreateBuffer)(next_gdpa ? next_gdpa(g_dev, "vkCreateBuffer") : dev_lookup("vkCreateBuffer"));
-
     RQ(CmdBeginRenderPass2);
+    if (!real_CmdBeginRenderPass2 && next_gdpa)
+        real_CmdBeginRenderPass2 = (PFN_vkCmdBeginRenderPass2)next_gdpa(g_dev, "vkCmdBeginRenderPass2KHR");
     RQ(CmdEndRenderPass2);
+    if (!real_CmdEndRenderPass2 && next_gdpa)
+        real_CmdEndRenderPass2 = (PFN_vkCmdEndRenderPass2)next_gdpa(g_dev, "vkCmdEndRenderPass2KHR");
+    RQ(CmdBeginRendering);
+    if (!real_CmdBeginRendering && next_gdpa)
+        real_CmdBeginRendering = (PFN_vkCmdBeginRendering)next_gdpa(g_dev, "vkCmdBeginRenderingKHR");
+    RQ(CmdEndRendering);
+    if (!real_CmdEndRendering && next_gdpa)
+        real_CmdEndRendering = (PFN_vkCmdEndRendering)next_gdpa(g_dev, "vkCmdEndRenderingKHR");
     RQ(CmdBindVertexBuffers);
     real_CreateBufferH = (PFN_vkCreateBuffer)(next_gdpa ? next_gdpa(g_dev, "vkCreateBuffer") : dev_lookup("vkCreateBuffer"));
 #undef RQ
     if (next_gdpa)
         cs_bind(g_dev, next_gdpa);
-    LOG("copysec: routing active");
+    DBG("copysec: routing active");
 }
 
 static void VKAPI_CALL wrapped_CmdCopyImage(VkCommandBuffer cb, VkImage src,
@@ -2439,6 +2528,17 @@ static void VKAPI_CALL wrapped_ResetCommandPool(VkDevice device,
         real_ResetCommandPool(device, pool, f);
 }
 
+static void VKAPI_CALL wrapped_DestroyCommandPool(VkDevice device,
+                                                  VkCommandPool pool,
+                                                  const VkAllocationCallbacks *a)
+{
+    resolve_device();
+    resolve_copyfns();
+    cs_track_destroypool(device, pool);
+    if (real_DestroyCommandPoolH)
+        real_DestroyCommandPoolH(device, pool, a);
+}
+
 static void VKAPI_CALL wrapped_CmdBeginRenderPassTracking(
     VkCommandBuffer cb, const VkRenderPassBeginInfo *i, VkSubpassContents c)
 {
@@ -2475,6 +2575,23 @@ static void VKAPI_CALL wrapped_CmdEndRenderPass2Tracking(
         real_CmdEndRenderPass2(cb, i);
 }
 
+static void VKAPI_CALL wrapped_CmdBeginRenderingTracking(
+    VkCommandBuffer cb, const VkRenderingInfo *i)
+{
+    resolve_copyfns();
+    cs_track_beginpass(cb);
+    if (real_CmdBeginRendering)
+        real_CmdBeginRendering(cb, i);
+}
+
+static void VKAPI_CALL wrapped_CmdEndRenderingTracking(VkCommandBuffer cb)
+{
+    resolve_copyfns();
+    cs_track_endpass(cb);
+    if (real_CmdEndRendering)
+        real_CmdEndRendering(cb);
+}
+
 static void VKAPI_CALL wrapped_CmdBindVertexBuffers(VkCommandBuffer cb,
                                                   uint32_t firstBinding,
                                                   uint32_t bindingCount,
@@ -2485,7 +2602,7 @@ static void VKAPI_CALL wrapped_CmdBindVertexBuffers(VkCommandBuffer cb,
     resolve_copyfns();
     for (uint32_t i = 0; i < bindingCount; i++)
         if (pOffsets[i])
-            LOG("vertex binding %u offset=%llu", firstBinding + i,
+            DBG("vertex binding %u offset=%llu", firstBinding + i,
                 (unsigned long long)pOffsets[i]);
     if (real_CmdBindVertexBuffers)
         real_CmdBindVertexBuffers(cb, firstBinding, bindingCount, pBuffers, pOffsets);
@@ -2500,7 +2617,7 @@ static VkResult VKAPI_CALL wrapped_GetImageSubresourceLayout(
     resolve_copyfns();
     static int dbgN;
     if (++dbgN <= 5)
-        LOG("GetImageSubresourceLayout #%d image=%p mip=%u layer=%u",
+        DBG("GetImageSubresourceLayout #%d image=%p mip=%u layer=%u",
             dbgN, (void *)image, pSubresource ? pSubresource->mipLevel : 0,
             pSubresource ? pSubresource->arrayLayer : 0);
     if (!real_GetImageSubresourceLayout)
@@ -2517,11 +2634,16 @@ static void VKAPI_CALL wrapped_DestroyDeviceHook(VkDevice device,
                                                  const VkAllocationCallbacks *a)
 {
     resolve_device();
-    resolve_copyfns();
     cs_destroy();
+    if (!real_DestroyDevice && next_gdpa && device)
+        real_DestroyDevice = (PFN_vkDestroyDevice)next_gdpa(device, "vkDestroyDevice");
     if (real_DestroyDevice)
         real_DestroyDevice(device, a);
-    g_dev = VK_NULL_HANDLE;
+    if (g_dev == device) {
+        g_dev = VK_NULL_HANDLE;
+        real_CreateShaderModule = NULL;
+        real_CmdCopyImage = NULL;
+    }
 }
 
 static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
@@ -2533,10 +2655,6 @@ static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     const VkImageCreateInfo *ci = pCreateInfo;
     VkImageCreateInfo patched;
-    /* LINEAR->OPTIMAL forcing for sampled images is opt-in (VKC_LINEAR_OPTIMAL=1).
-     * Forcing it changed per-frame texture sampling in a bad way (frame-to-frame
-     * colour cycling), so the default is OFF: run with VKC_LINEAR_OPTIMAL=1 to
-     * compare. VKC_NO_LINEAR_OPTIMAL=1 is accepted as an explicit opt-out. */
     const char *linopt = getenv("VKC_LINEAR_OPTIMAL");
     const char *nlin = getenv("VKC_NO_LINEAR_OPTIMAL");
     int want_optimal = (linopt && linopt[0] == '1') && !(nlin && nlin[0] == '1');
@@ -2545,7 +2663,7 @@ static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
         patched = *pCreateInfo;
         patched.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci = &patched;
-        LOG("image tiling forced optimal: %dx%d format=%d", pCreateInfo->extent.width,
+        DBG("image tiling forced optimal: %dx%d format=%d", pCreateInfo->extent.width,
             pCreateInfo->extent.height, (int)pCreateInfo->format);
     }
     if (real_CreateImage)
@@ -2594,7 +2712,7 @@ static VkResult VKAPI_CALL wrapped_CreateBufferView(VkDevice device,
         bufview_add(*pBufferView, pCreateInfo->buffer, pCreateInfo->offset,
                     pCreateInfo->range);
         pthread_mutex_unlock(&g_bufview_mtx);
-        LOG("buffer view %p: buffer=%p offset=%llu range=%llu format=%d",
+        DBG("buffer view %p: buffer=%p offset=%llu range=%llu format=%d",
             (void *)*pBufferView, (void *)pCreateInfo->buffer,
             (unsigned long long)pCreateInfo->offset, (unsigned long long)pCreateInfo->range,
             (int)pCreateInfo->format);
@@ -2647,125 +2765,37 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
                                                        const VkWriteDescriptorSet *pDescriptorWrites)
 {
     resolve_device();
-    { static unsigned counts[512] = {0};
-      if (descriptorWriteCount < 512) counts[descriptorWriteCount]++; }
-    if (getenv("VKC_DUMP_RT") && g_atlas_dbg && g_atlas_ptr && !g_rt_big_done && descriptorWriteCount > 64) {
-        g_rt_big_done = 1;
-        LOG("RT: push with count=%u > 64!", descriptorWriteCount);
+    int has_texel = 0;
+    if (pDescriptorWrites) {
+        for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+            if (pDescriptorWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+                has_texel = 1;
+                break;
+            }
+        }
+    }
+    if (!has_texel && !g_debug) {
+        if (real_CmdPushDescriptorSetKHR)
+            real_CmdPushDescriptorSetKHR(commandBuffer, pipelineBindPoint, layout, set,
+                                         descriptorWriteCount, pDescriptorWrites);
+        return;
     }
     VkWriteDescriptorSet w[64];
     VkDescriptorBufferInfo infos[64];
     VkBufferView views[64];
     if (descriptorWriteCount <= 64 && pDescriptorWrites) {
         memcpy(w, pDescriptorWrites, descriptorWriteCount * sizeof(w[0]));
-        memset(infos, 0, sizeof(infos));
-        memset(views, 0, sizeof(views));
+        memset(infos, 0, descriptorWriteCount * sizeof(infos[0]));
+        memset(views, 0, descriptorWriteCount * sizeof(views[0]));
         rewrite_texel_buffers(w, descriptorWriteCount, infos, views);
-        for (uint32_t i = 0; i < descriptorWriteCount; i++) {
-            if (w[i].pBufferInfo && (w[i].pBufferInfo->offset || w[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER))
-                DBG("push desc: binding=%u type=%d offset=%llu range=%llu",
-                    w[i].dstBinding, (int)w[i].descriptorType,
-                    (unsigned long long)w[i].pBufferInfo->offset,
-                    (unsigned long long)w[i].pBufferInfo->range);
-            { static int dbg0; if (!dbg0++) DBG("push wrapper hit, first count=%u", descriptorWriteCount); }
-            if (g_debug && (g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
-                static int dumpn;
-                if (++dumpn % 2000 == 0 && g_atlas_done < 9) {
-                    FILE *f = fopen("/tmp/atlas.ppm", "wb");
-                    if (f) {
-                        fprintf(f, "P6\n1024 1024\n255\n");
-                        for (int y = 1023; y >= 0; y--)
-                            fwrite(g_atlas_ptr + (size_t)y * 1024 * 4, 1, 1024 * 3, f);
-                        fclose(f);
-                    }
-                    DBG("DUMPING atlas.ppm (at push)");
-                }
-            }
-            if (getenv("VKC_DUMP_UBO") && g_atlas_dbg && g_atlas_ptr && !g_ubo_done &&
-                w[i].pBufferInfo && w[i].pBufferInfo->offset != 0 &&
-                w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
-                PFN_vkCmdCopyBuffer rq5 =
-                    (PFN_vkCmdCopyBuffer)next_gdpa(g_dev, "vkCmdCopyBuffer");
-                VkBufferCopy bc = {0};
-                bc.srcOffset = w[i].pBufferInfo->offset;
-                bc.dstOffset = 0;
-                bc.size = 64;
-                rq5(commandBuffer, w[i].pBufferInfo->buffer, g_atlas_dbg, 1, &bc);
-                /* also byte 0 at +64 */
-                bc.srcOffset = 0;
-                bc.dstOffset = 64;
-                bc.size = 64;
-                rq5(commandBuffer, w[i].pBufferInfo->buffer, g_atlas_dbg, 1, &bc);
-                g_ubo_done = 1;
-                DBG("ubo readback recorded: binding=%u offset=%llu", w[i].dstBinding,
-                    (unsigned long long)w[i].pBufferInfo->offset);
-                g_atlas_done = 1;
-            }
-            if (w[i].pImageInfo)
-                DBG("push img: binding=%u type=%d view=%p sampler=%p layout=%d",
-                    w[i].dstBinding, (int)w[i].descriptorType,
-                    (void *)w[i].pImageInfo->imageView,
-                    (void *)w[i].pImageInfo->sampler,
-                    (int)w[i].pImageInfo->imageLayout);
-            if (getenv("VKC_DUMP_RT") && g_atlas_dbg && g_atlas_ptr && !g_rt_done &&
-                w[i].pImageInfo &&
-                w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-                w[i].pImageInfo->imageLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-                extern void *vimg(void *view);
-                void *_img0 = vimg((void *)w[i].pImageInfo->imageView);
-                static int rtcount;
-                if (_img0 && ++rtcount <= 4 && !cs_in_pass(commandBuffer)) {
-                /* First sampled read of a render target: read it back.
-                 * We need the image handle: image views created with
-                 * VKC_LOG_IMAGES printed "image view %p: image=%p..." ; here
-                 * we approximate by capturing the view directly. */
-                extern void *vimg(void *view);
-                void *img = vimg((void *)w[i].pImageInfo->imageView);
-                if (img && !cs_in_pass(commandBuffer)) {
-                    VkImage imgh = (VkImage)img;
-                    PFN_vkCmdPipelineBarrier rq3 =
-                        (PFN_vkCmdPipelineBarrier)next_gdpa(g_dev, "vkCmdPipelineBarrier");
-                    VkImageMemoryBarrier b = {0};
-                    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                    b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    b.image = imgh;
-                    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                    b.subresourceRange.levelCount = 1;
-                    b.subresourceRange.layerCount = 1;
-                    rq3(commandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-                    VkBufferImageCopy rb = {0};
-                    rb.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                    rb.imageSubresource.layerCount = 1;
-                    rb.imageExtent.width = 1024;
-                    rb.imageExtent.height = 1024;
-                    rb.imageExtent.depth = 1;
-                    PFN_vkCmdCopyImageToBuffer rq4 =
-                        (PFN_vkCmdCopyImageToBuffer)next_gdpa(g_dev, "vkCmdCopyImageToBuffer");
-                    rq4(commandBuffer, imgh, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_atlas_dbg, 1, &rb);
-                    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                    rq3(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-                    g_rt_done = 1;
-                    LOG("rt readback recorded from view %p image %p",
-                        (void *)w[i].pImageInfo->imageView, img);
-                }
-            }
-        }
+        if (real_CmdPushDescriptorSetKHR)
+            real_CmdPushDescriptorSetKHR(commandBuffer, pipelineBindPoint, layout, set,
+                                         descriptorWriteCount, w);
+        return;
     }
-    if (real_CmdPushDescriptorSetKHR) {
-        const VkWriteDescriptorSet *pass = (descriptorWriteCount <= 64 && pDescriptorWrites)
-            ? w : pDescriptorWrites;
+    if (real_CmdPushDescriptorSetKHR)
         real_CmdPushDescriptorSetKHR(commandBuffer, pipelineBindPoint, layout, set,
-                                     descriptorWriteCount, pass);
-    }
-    }
+                                     descriptorWriteCount, pDescriptorWrites);
 }
 
 static void VKAPI_CALL wrapped_UpdateDescriptorSets(VkDevice device,
@@ -2775,27 +2805,28 @@ static void VKAPI_CALL wrapped_UpdateDescriptorSets(VkDevice device,
                                                     const VkCopyDescriptorSet *pDescriptorCopies)
 {
     resolve_device();
-    for (uint32_t i = 0; i < descriptorWriteCount; i++) {
-        const VkWriteDescriptorSet *w = &pDescriptorWrites[i];
-        if (getenv("VKC_LOG_IMAGES"))
-            LOG("descriptor write: set=%u binding=%u array=%u count=%u type=%d image=%p sampler=%p bufview=%p",
-                w->dstSet, w->dstBinding, w->dstArrayElement, w->descriptorCount,
-                (int)w->descriptorType, (void *)w->pImageInfo,
-                w->pImageInfo ? (void *)w->pImageInfo->sampler : NULL,
-                (void *)w->pBufferInfo);
-        if (w->pBufferInfo && (w->pBufferInfo->offset || w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER))
-            LOG("descriptor buf: binding=%u type=%d offset=%llu range=%llu",
-                w->dstBinding, (int)w->descriptorType,
-                (unsigned long long)w->pBufferInfo->offset,
-                (unsigned long long)w->pBufferInfo->range);
+    int has_texel = 0;
+    if (pDescriptorWrites) {
+        for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+            if (pDescriptorWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+                has_texel = 1;
+                break;
+            }
+        }
+    }
+    if (!has_texel && !g_debug) {
+        if (real_UpdateDescriptorSets)
+            real_UpdateDescriptorSets(device, descriptorWriteCount, pDescriptorWrites,
+                                      descriptorCopyCount, pDescriptorCopies);
+        return;
     }
     VkWriteDescriptorSet w[64];
     VkDescriptorBufferInfo infos[64];
     VkBufferView views[64];
     if (descriptorWriteCount <= 64 && pDescriptorWrites) {
         memcpy(w, pDescriptorWrites, descriptorWriteCount * sizeof(w[0]));
-        memset(infos, 0, sizeof(infos));
-        memset(views, 0, sizeof(views));
+        memset(infos, 0, descriptorWriteCount * sizeof(infos[0]));
+        memset(views, 0, descriptorWriteCount * sizeof(views[0]));
         rewrite_texel_buffers(w, descriptorWriteCount, infos, views);
         if (real_UpdateDescriptorSets)
             real_UpdateDescriptorSets(device, descriptorWriteCount, w, descriptorCopyCount,
@@ -2821,6 +2852,11 @@ static VkResult VKAPI_CALL wrapped_AcquireNextImageKHR(VkDevice device, VkSwapch
                                                         VkFence fence, uint32_t *pImageIndex)
 {
     resolve_device();
+    if (!g_debug) {
+        return real_AcquireNextImageKHR
+            ? real_AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex)
+            : VK_ERROR_INITIALIZATION_FAILED;
+    }
     uint64_t t0 = now_ms();
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (real_AcquireNextImageKHR)
@@ -2828,9 +2864,9 @@ static VkResult VKAPI_CALL wrapped_AcquireNextImageKHR(VkDevice device, VkSwapch
     uint64_t dt = now_ms() - t0;
     if (r == VK_SUCCESS) {
         if (dt > 50)
-            LOG("AcquireNextImageKHR slow: %llu ms", (unsigned long long)dt);
+            DBG("AcquireNextImageKHR slow: %llu ms", (unsigned long long)dt);
     } else {
-        LOG("AcquireNextImageKHR r=%d after %llu ms", r, (unsigned long long)dt);
+        DBG("AcquireNextImageKHR r=%d after %llu ms", r, (unsigned long long)dt);
     }
     return r;
 }
@@ -2841,13 +2877,9 @@ static VkResult VKAPI_CALL wrapped_QueuePresentKHR(VkQueue queue, const VkPresen
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (real_QueuePresentKHR)
         r = real_QueuePresentKHR(queue, pPresentInfo);
-    if (r != VK_SUCCESS)
-        LOG("QueuePresentKHR r=%d", r);
-    /*
-     * Count the presented frames: this is the frame rate the application
-     * actually achieves on the GPU (no need to inject an F3 keypress).
-     */
-    {
+    if (g_debug) {
+        if (r != VK_SUCCESS)
+            DBG("QueuePresentKHR r=%d", r);
         static uint64_t frames;
         static uint64_t t_start;
         static uint64_t t_last;
@@ -2857,7 +2889,7 @@ static VkResult VKAPI_CALL wrapped_QueuePresentKHR(VkQueue queue, const VkPresen
             t_start = t;
             t_last = t;
         } else if (t - t_last >= 2000) {
-            LOG("FPS: %.1f (%llu frames in %llu ms)", (double)frames * 1000.0 / (double)(t - t_start),
+            DBG("FPS: %.1f (%llu frames in %llu ms)", (double)frames * 1000.0 / (double)(t - t_start),
                 (unsigned long long)frames, (unsigned long long)(t - t_start));
             frames = 0;
             t_start = t;
@@ -2875,6 +2907,29 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, co
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkInstance instance,
                                                                          const char *name);
 
+static int want_copysec(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *no = getenv("VKC_NO_COPYSEC");
+        cached = (no && no[0] == '1') ? 0 : 1; /* default ON */
+    }
+    return cached;
+}
+
+static int want_linear_optimal(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *linopt = getenv("VKC_LINEAR_OPTIMAL");
+        const char *nlin = getenv("VKC_NO_LINEAR_OPTIMAL");
+        const char *logi = getenv("VKC_LOG_IMAGES");
+        cached = (((linopt && linopt[0] == '1') && !(nlin && nlin[0] == '1')) ||
+                  (logi && logi[0] == '1')) ? 1 : 0;
+    }
+    return cached;
+}
+
 static PFN_vkVoidFunction intercept(const char *name)
 {
     if (!name)
@@ -2886,72 +2941,87 @@ static PFN_vkVoidFunction intercept(const char *name)
         return (PFN_vkVoidFunction)wrapped_DestroyInstance;
     if (strcmp(name, "vkCreateDevice") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateDevice;
+    if (strcmp(name, "vkDestroyDevice") == 0)
+        return (PFN_vkVoidFunction)wrapped_DestroyDeviceHook;
     if (strcmp(name, "vkCreateGraphicsPipelines") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateGraphicsPipelines;
+    if (strcmp(name, "vkCreateComputePipelines") == 0)
+        return (PFN_vkVoidFunction)wrapped_CreateComputePipelines;
     if (strcmp(name, "vkCreatePipelineLayout") == 0)
         return (PFN_vkVoidFunction)wrapped_CreatePipelineLayout;
     if (strcmp(name, "vkCreateDescriptorSetLayout") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateDescriptorSetLayout;
     if (strcmp(name, "vkCreateShaderModule") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateShaderModule;
+    if (strcmp(name, "vkDestroyShaderModule") == 0)
+        return (PFN_vkVoidFunction)wrapped_DestroyShaderModule;
     if (strcmp(name, "vkUpdateDescriptorSets") == 0)
         return (PFN_vkVoidFunction)wrapped_UpdateDescriptorSets;
     if (strcmp(name, "vkCreateBufferView") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateBufferView;
-    if (strcmp(name, "vkCreateImage") == 0)
-        return (PFN_vkVoidFunction)wrapped_CreateImage;
-    if (strcmp(name, "vkCmdCopyBufferToImage") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdCopyBufferToImage;
-    if (strcmp(name, "vkCmdCopyImage") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdCopyImage;
-    if (strcmp(name, "vkCmdCopyImageToBuffer") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdCopyImageToBuffer;
-    if (strcmp(name, "vkCmdBlitImage") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdBlitImage;
-    if (strcmp(name, "vkCmdCopyBufferToImage2") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdCopyBufferToImage2;
-    if (strcmp(name, "vkCmdCopyImageToBuffer2") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdCopyImageToBuffer2;
-    if (strcmp(name, "vkCmdCopyImage2") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdCopyImage2;
-    if (strcmp(name, "vkCmdBlitImage2") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdBlitImage2;
-    if (strcmp(name, "vkAllocateCommandBuffers") == 0)
-        return (PFN_vkVoidFunction)wrapped_AllocateCommandBuffers;
-    if (strcmp(name, "vkFreeCommandBuffers") == 0)
-        return (PFN_vkVoidFunction)wrapped_FreeCommandBuffers;
-    if (strcmp(name, "vkBeginCommandBuffer") == 0)
-        return (PFN_vkVoidFunction)wrapped_BeginCommandBuffer;
-    if (strcmp(name, "vkResetCommandBuffer") == 0)
-        return (PFN_vkVoidFunction)wrapped_ResetCommandBuffer;
-    if (strcmp(name, "vkResetCommandPool") == 0)
-        return (PFN_vkVoidFunction)wrapped_ResetCommandPool;
-    if (strcmp(name, "vkCmdBeginRenderPass") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPassTracking;
-    if (strcmp(name, "vkCmdEndRenderPass") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdEndRenderPassTracking;
-    if (strcmp(name, "vkCmdBindVertexBuffers") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdBindVertexBuffers;
-    if (strcmp(name, "vkGetImageSubresourceLayout") == 0)
-        return (PFN_vkVoidFunction)wrapped_GetImageSubresourceLayout;
-    if (strcmp(name, "vkCmdBeginRenderPass2") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPass2Tracking;
-    if (strcmp(name, "vkCmdEndRenderPass2") == 0)
-        return (PFN_vkVoidFunction)wrapped_CmdEndRenderPass2Tracking;
-    if (strcmp(name, "vkDestroyDevice") == 0)
-        return (PFN_vkVoidFunction)wrapped_DestroyDeviceHook;
-    if (strcmp(name, "vkCreateImageView") == 0)
-        return (PFN_vkVoidFunction)wrapped_CreateImageView;
     if (strcmp(name, "vkCreateSampler") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateSampler;
-    if (strcmp(name, "vkCmdPushDescriptorSetKHR") == 0)
+    if (strcmp(name, "vkCmdPushDescriptorSetKHR") == 0 ||
+        strcmp(name, "vkCmdPushDescriptorSet") == 0)
         return (PFN_vkVoidFunction)wrapped_CmdPushDescriptorSetKHR;
-    if (strcmp(name, "vkDestroyShaderModule") == 0)
-        return (PFN_vkVoidFunction)wrapped_DestroyShaderModule;
-    if (strcmp(name, "vkAcquireNextImageKHR") == 0)
-        return (PFN_vkVoidFunction)wrapped_AcquireNextImageKHR;
-    if (strcmp(name, "vkQueuePresentKHR") == 0)
-        return (PFN_vkVoidFunction)wrapped_QueuePresentKHR;
+    if (want_linear_optimal() && strcmp(name, "vkCreateImage") == 0)
+        return (PFN_vkVoidFunction)wrapped_CreateImage;
+    if (want_copysec()) {
+        if (strcmp(name, "vkCmdCopyBufferToImage") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdCopyBufferToImage;
+        if (strcmp(name, "vkCmdCopyImage") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdCopyImage;
+        if (strcmp(name, "vkCmdCopyImageToBuffer") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdCopyImageToBuffer;
+        if (strcmp(name, "vkCmdBlitImage") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdBlitImage;
+        if (strcmp(name, "vkCmdCopyBufferToImage2") == 0 ||
+            strcmp(name, "vkCmdCopyBufferToImage2KHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdCopyBufferToImage2;
+        if (strcmp(name, "vkCmdCopyImageToBuffer2") == 0 ||
+            strcmp(name, "vkCmdCopyImageToBuffer2KHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdCopyImageToBuffer2;
+        if (strcmp(name, "vkCmdCopyImage2") == 0 ||
+            strcmp(name, "vkCmdCopyImage2KHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdCopyImage2;
+        if (strcmp(name, "vkCmdBlitImage2") == 0 ||
+            strcmp(name, "vkCmdBlitImage2KHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdBlitImage2;
+        if (strcmp(name, "vkAllocateCommandBuffers") == 0)
+            return (PFN_vkVoidFunction)wrapped_AllocateCommandBuffers;
+        if (strcmp(name, "vkFreeCommandBuffers") == 0)
+            return (PFN_vkVoidFunction)wrapped_FreeCommandBuffers;
+        if (strcmp(name, "vkBeginCommandBuffer") == 0)
+            return (PFN_vkVoidFunction)wrapped_BeginCommandBuffer;
+        if (strcmp(name, "vkResetCommandBuffer") == 0)
+            return (PFN_vkVoidFunction)wrapped_ResetCommandBuffer;
+        if (strcmp(name, "vkResetCommandPool") == 0)
+            return (PFN_vkVoidFunction)wrapped_ResetCommandPool;
+        if (strcmp(name, "vkDestroyCommandPool") == 0)
+            return (PFN_vkVoidFunction)wrapped_DestroyCommandPool;
+        if (strcmp(name, "vkCmdBeginRenderPass") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPassTracking;
+        if (strcmp(name, "vkCmdEndRenderPass") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdEndRenderPassTracking;
+        if (strcmp(name, "vkCmdBeginRenderPass2") == 0 ||
+            strcmp(name, "vkCmdBeginRenderPass2KHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdBeginRenderPass2Tracking;
+        if (strcmp(name, "vkCmdEndRenderPass2") == 0 ||
+            strcmp(name, "vkCmdEndRenderPass2KHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdEndRenderPass2Tracking;
+        if (strcmp(name, "vkCmdBeginRendering") == 0 ||
+            strcmp(name, "vkCmdBeginRenderingKHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdBeginRenderingTracking;
+        if (strcmp(name, "vkCmdEndRendering") == 0 ||
+            strcmp(name, "vkCmdEndRenderingKHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_CmdEndRenderingTracking;
+    }
+    if (g_debug) {
+        if (strcmp(name, "vkAcquireNextImageKHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_AcquireNextImageKHR;
+        if (strcmp(name, "vkQueuePresentKHR") == 0)
+            return (PFN_vkVoidFunction)wrapped_QueuePresentKHR;
+    }
     return NULL;
 }
 
@@ -2963,7 +3033,7 @@ static PFN_vkVoidFunction intercept(const char *name)
  */
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char *name)
 {
-    LOG("GIPA-ENTRY %s", name ? name : "(null)");
+    DBG("GIPA-ENTRY %s", name ? name : "(null)");
     if (!name)
         return NULL;
     if (strcmp(name, "vkGetInstanceProcAddr") == 0)
@@ -2982,7 +3052,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instan
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char *name)
 {
-    LOG("GDPA-ENTRY %s", name ? name : "(null)");
+    DBG("GDPA-ENTRY %s", name ? name : "(null)");
     if (!name)
         return NULL;
     if (strcmp(name, "vkGetDeviceProcAddr") == 0)
@@ -3114,11 +3184,14 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice device,
 
 __attribute__((constructor)) static void shim_init(void)
 {
-    log_open();
-    /* Optional: capture the application's stdout/stderr into a file.  The
-       launcher swallows the game's output, so this is the only way to see a
-       JVM crash report. */
+    const char *env = getenv("VKC_DIR");
+    if (env && *env)
+        snprintf(g_dir, sizeof(g_dir), "%s", env);
+    g_debug = getenv("VKC_DEBUG") ? 1 : 0;
+    if (g_debug)
+        log_open();
     if (getenv("VKC_CAPTURE_STDERR")) {
+        mkdir(g_dir, 0755);
         char sp[512];
         snprintf(sp, sizeof(sp), "%s/app-stderr.log", g_dir);
         int sfd = open(sp, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -3128,6 +3201,7 @@ __attribute__((constructor)) static void shim_init(void)
         }
     }
     if (getenv("VKC_SEGV")) {
+        mkdir(g_dir, 0755);
         char cp[512];
         snprintf(cp, sizeof(cp), "%s/segv.log", g_dir);
         g_crashfd = open(cp, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -3140,7 +3214,7 @@ __attribute__((constructor)) static void shim_init(void)
     }
     g_repair = getenv("VKC_REPAIR") ? (atoi(getenv("VKC_REPAIR")) ? 1 : 0) : 1;
     g_probe = getenv("VKC_PROBE") ? (atoi(getenv("VKC_PROBE")) ? 1 : 0) : 0;
-    g_retry = getenv("VKC_RETRY") ? atoi(getenv("VKC_RETRY")) : 12;
+    g_retry = getenv("VKC_RETRY") ? atoi(getenv("VKC_RETRY")) : 3;
     g_strip_debug = getenv("VKC_STRIP_DEBUG") ? (atoi(getenv("VKC_STRIP_DEBUG")) ? 1 : 0) : 0;
     g_require_vulkan = getenv("VKC_REQUIRE_VULKAN") ? 1 : 0;
 
@@ -3149,6 +3223,7 @@ __attribute__((constructor)) static void shim_init(void)
         "/lib/libVK_IMG.so",
         "/usr/lib/libVK_IMG.so",
         "/usr/lib/libVK_IMG.so.24.2.6603887",
+        "/usr/lib/aarch64-linux-gnu/GL/default/lib/libVK_IMG.so",
     };
     for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
         g_drv = dlopen(cands[i], RTLD_NOW | RTLD_LOCAL);
@@ -3159,6 +3234,7 @@ __attribute__((constructor)) static void shim_init(void)
         LOG("shim_init: FATAL cannot dlopen PowerVR ICD: %s", dlerror());
         return;
     }
+    dl_iterate_phdr(uf_phdr_cb, NULL);
 
     PFN_vkVoidFunction (*icd_gipa)(void *, const char *) =
         (PFN_vkVoidFunction(*)(void *, const char *))dlsym(g_drv, "vk_icdGetInstanceProcAddr");
@@ -3182,7 +3258,7 @@ __attribute__((constructor)) static void shim_init(void)
         g_drv_gpdpa = (PFN_vkVoidFunction(*)(void *, const char *))icd_gipa(
             VK_NULL_HANDLE, "vk_icdGetPhysicalDeviceProcAddr");
 
-    LOG("shim_init: driver=%p gipa=%p gdpa=%p repair=%d requireVulkan=%d dir=%s", g_drv,
+    DBG("shim_init: driver=%p gipa=%p gdpa=%p repair=%d requireVulkan=%d dir=%s", g_drv,
         (void *)g_drv_gipa, (void *)g_drv_gdpa, g_repair, g_require_vulkan, g_dir);
 }
 

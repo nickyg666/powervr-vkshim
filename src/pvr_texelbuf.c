@@ -85,6 +85,18 @@ static int decode(const uint32_t *w, size_t words, struct insn *out, size_t max,
     return 0;
 }
 
+static int has_substr(const uint32_t *code, size_t words, const char *needle)
+{
+    size_t nlen = strlen(needle);
+    size_t total = words * 4;
+    const char *bytes = (const char *)code;
+    for (size_t i = 0; i + nlen <= total; i++) {
+        if (bytes[i] == needle[0] && memcmp(bytes + i, needle, nlen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *out_words)
 {
     struct insn *ins;
@@ -96,20 +108,19 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
     uint32_t fetch_vec = 0;
     uint32_t bound;
     uint32_t next_id;
-    uint32_t int8_id, rtarr_id, struct_id, sb_ptr_id, elem_ptr_id;
+    uint32_t int8_id = 0, elem_type_id = 0, rtarr_id, struct_id, sb_ptr_id, elem_ptr_id;
     size_t first_type = 0;
     int have_first_type = 0;
-    size_t nfetch = 0;
     uint32_t *out = NULL;
     size_t outn = 0, outcap = 0;
 
     if (!code || words < 6 || code[0] != SPIRV_MAGIC)
         return NULL;
 
-    ins = malloc(sizeof(*ins) * 4096);
+    ins = malloc(sizeof(*ins) * 8192);
     if (!ins)
         return NULL;
-    if (decode(code, words, ins, 4096, &nins) != 0) {
+    if (decode(code, words, ins, 8192, &nins) != 0) {
         free(ins);
         return NULL;
     }
@@ -154,10 +165,14 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
             break;
         }
     }
-    if (!image_id || !sampled_id || !ptr_id || !var_id || !fetch_vec) {
+    if (!image_id || !sampled_id || !ptr_id || !var_id) {
         free(ins);
         return NULL;
     }
+
+    /* Minecraft's CloudFaces uses R8_SINT (1-byte elements); Sodium's
+     * u_SectionTimeInfo and general texel buffers use 32-bit elements. */
+    int use_int8 = has_substr(code, words, "CloudFaces") || has_substr(code, words, "clouds");
 
     next_id = bound;
 #define NEWID() (next_id++)
@@ -166,89 +181,102 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
         zero_id = NEWID();
         zero_new = 1;
     }
-    int8_id = NEWID();
+    if (use_int8) {
+        int8_id = NEWID();
+        elem_type_id = int8_id;
+    } else {
+        elem_type_id = comp_type;
+    }
     rtarr_id = NEWID();
     struct_id = NEWID();
     sb_ptr_id = NEWID();
     elem_ptr_id = NEWID();
 
-    /* the new type instructions, in dependency order */
-    /*
-     * The new instructions, in the order they have to appear:
-     *   - the Block/Offset decorations for the storage buffer struct,
-     *   - the types.
-     */
-    uint32_t newins[10][6];
-    int nnew = 0;
-#define NEWINSN(n) do {                                              \
-        newins[nnew][0] = ((uint32_t)(n) << 16);                    \
-        newins[nnew][1] = 0; newins[nnew][2] = 0;                   \
-        newins[nnew][3] = 0; newins[nnew][4] = 0; newins[nnew][5] = 0; \
+    /* Group 1: Decorations (must be emitted in the Annotations section, BEFORE first_type) */
+    uint32_t decins[4][6];
+    int ndec = 0;
+#define DECINSN(n) do {                                              \
+        decins[ndec][0] = ((uint32_t)(n) << 16);                     \
+        decins[ndec][1] = 0; decins[ndec][2] = 0;                    \
+        decins[ndec][3] = 0; decins[ndec][4] = 0; decins[ndec][5] = 0; \
     } while (0)
     /* OpDecorate %struct Block */
-    NEWINSN(3);
-    newins[nnew][0] |= OP_DECORATE;
-    newins[nnew][1] = struct_id;
-    newins[nnew][2] = DECORATION_BLOCK;
-    nnew++;
+    DECINSN(3);
+    decins[ndec][0] |= OP_DECORATE;
+    decins[ndec][1] = struct_id;
+    decins[ndec][2] = DECORATION_BLOCK;
+    ndec++;
     /* OpMemberDecorate %struct 0 Offset 0 */
-    NEWINSN(5);
-    newins[nnew][0] |= OP_MEMBER_DECORATE;
-    newins[nnew][1] = struct_id;
-    newins[nnew][2] = 0;
-    newins[nnew][3] = DECORATION_OFFSET;
-    newins[nnew][4] = 0;
-    nnew++;
-    /* OpDecorate %rtarr ArrayStride 1 */
-    NEWINSN(4);
-    newins[nnew][0] |= OP_DECORATE;
-    newins[nnew][1] = rtarr_id;
-    newins[nnew][2] = DECORATION_ARRAY_STRIDE;
-    newins[nnew][3] = 1;
-    nnew++;
-    /* OpTypeInt 8 1 */
-    NEWINSN(4);
-    newins[nnew][0] |= OP_TYPE_INT;
-    newins[nnew][1] = int8_id;
-    newins[nnew][2] = 8;
-    newins[nnew][3] = 1;
-    nnew++;
-    /* OpTypeRuntimeArray %int8 */
-    NEWINSN(3);
-    newins[nnew][0] |= OP_TYPE_RUNTIME_ARRAY;
-    newins[nnew][1] = rtarr_id;
-    newins[nnew][2] = int8_id;
-    nnew++;
-    /* OpTypeStruct %rtarr */
-    NEWINSN(3);
-    newins[nnew][0] |= OP_TYPE_STRUCT;
-    newins[nnew][1] = struct_id;
-    newins[nnew][2] = rtarr_id;
-    nnew++;
-    /* OpTypePointer StorageBuffer %struct */
-    NEWINSN(4);
-    newins[nnew][0] |= OP_TYPE_POINTER;
-    newins[nnew][1] = sb_ptr_id;
-    newins[nnew][2] = SC_STORAGE_BUFFER;
-    newins[nnew][3] = struct_id;
-    nnew++;
-    /* OpConstant %int 0 (only if the module does not have one) */
-    if (zero_new) {
-        NEWINSN(4);
-        newins[nnew][0] |= OP_CONSTANT;
-        newins[nnew][1] = comp_type;
-        newins[nnew][2] = zero_id;
-        newins[nnew][3] = 0;
-        nnew++;
+    DECINSN(5);
+    decins[ndec][0] |= OP_MEMBER_DECORATE;
+    decins[ndec][1] = struct_id;
+    decins[ndec][2] = 0;
+    decins[ndec][3] = DECORATION_OFFSET;
+    decins[ndec][4] = 0;
+    ndec++;
+    /* OpDecorate %rtarr ArrayStride (1 or 4) */
+    DECINSN(4);
+    decins[ndec][0] |= OP_DECORATE;
+    decins[ndec][1] = rtarr_id;
+    decins[ndec][2] = DECORATION_ARRAY_STRIDE;
+    decins[ndec][3] = use_int8 ? 1u : 4u;
+    ndec++;
+#undef DECINSN
+
+    /* Group 2: Types & Constants (must be emitted AFTER comp_type is defined,
+     * right before var_id's OpVariable) */
+    uint32_t typeins[8][6];
+    int ntype = 0;
+#define TYPEINSN(n) do {                                             \
+        typeins[ntype][0] = ((uint32_t)(n) << 16);                   \
+        typeins[ntype][1] = 0; typeins[ntype][2] = 0;                \
+        typeins[ntype][3] = 0; typeins[ntype][4] = 0; typeins[ntype][5] = 0; \
+    } while (0)
+    if (use_int8) {
+        /* OpTypeInt 8 1 */
+        TYPEINSN(4);
+        typeins[ntype][0] |= OP_TYPE_INT;
+        typeins[ntype][1] = int8_id;
+        typeins[ntype][2] = 8;
+        typeins[ntype][3] = 1;
+        ntype++;
     }
-    /* OpTypePointer StorageBuffer %int8 */
-    NEWINSN(4);
-    newins[nnew][0] |= OP_TYPE_POINTER;
-    newins[nnew][1] = elem_ptr_id;
-    newins[nnew][2] = SC_STORAGE_BUFFER;
-    newins[nnew][3] = int8_id;
-    nnew++;
-#undef NEWINSN
+    /* OpTypeRuntimeArray %elem_type */
+    TYPEINSN(3);
+    typeins[ntype][0] |= OP_TYPE_RUNTIME_ARRAY;
+    typeins[ntype][1] = rtarr_id;
+    typeins[ntype][2] = elem_type_id;
+    ntype++;
+    /* OpTypeStruct %rtarr */
+    TYPEINSN(3);
+    typeins[ntype][0] |= OP_TYPE_STRUCT;
+    typeins[ntype][1] = struct_id;
+    typeins[ntype][2] = rtarr_id;
+    ntype++;
+    /* OpTypePointer StorageBuffer %struct */
+    TYPEINSN(4);
+    typeins[ntype][0] |= OP_TYPE_POINTER;
+    typeins[ntype][1] = sb_ptr_id;
+    typeins[ntype][2] = SC_STORAGE_BUFFER;
+    typeins[ntype][3] = struct_id;
+    ntype++;
+    /* OpConstant %comp_type 0 (only if the module does not have one) */
+    if (zero_new) {
+        TYPEINSN(4);
+        typeins[ntype][0] |= OP_CONSTANT;
+        typeins[ntype][1] = comp_type;
+        typeins[ntype][2] = zero_id;
+        typeins[ntype][3] = 0;
+        ntype++;
+    }
+    /* OpTypePointer StorageBuffer %elem_type */
+    TYPEINSN(4);
+    typeins[ntype][0] |= OP_TYPE_POINTER;
+    typeins[ntype][1] = elem_ptr_id;
+    typeins[ntype][2] = SC_STORAGE_BUFFER;
+    typeins[ntype][3] = elem_type_id;
+    ntype++;
+#undef TYPEINSN
 
     outcap = words + 256 + nins * 6;
     out = malloc(outcap * sizeof(uint32_t));
@@ -263,13 +291,15 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
         out[outn++] = code[i];
     out[3] = next_id;
 
-    /* capabilities */
-    out[outn++] = (2u << 16) | OP_CAPABILITY;
-    out[outn++] = CAP_INT8;
-    out[outn++] = (2u << 16) | OP_CAPABILITY;
-    out[outn++] = CAP_STORAGE_BUFFER_8BIT;
+    /* capabilities (only needed for 8-bit storage buffer) */
+    if (use_int8) {
+        out[outn++] = (2u << 16) | OP_CAPABILITY;
+        out[outn++] = CAP_INT8;
+        out[outn++] = (2u << 16) | OP_CAPABILITY;
+        out[outn++] = CAP_STORAGE_BUFFER_8BIT;
+    }
 
-    /* find where the type section starts so the new types can be inserted */
+    /* find where the type section starts so the decorations can be inserted before it */
     for (i = 0; i < nins; i++) {
         if (is_type_op(ins[i].op)) {
             first_type = i;
@@ -308,16 +338,21 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
         uint16_t wc = ins[i].wc;
 
         if (i == first_type) {
-            int k;
-            for (k = 0; k < nnew; k++) {
-                uint32_t wc = newins[k][0] >> 16;
-                PUSH((int)wc);
-                for (uint32_t q = 0; q < wc; q++)
-                    out[outn++] = newins[k][q];
+            for (int k = 0; k < ndec; k++) {
+                uint32_t dwc = decins[k][0] >> 16;
+                PUSH((int)dwc);
+                for (uint32_t q = 0; q < dwc; q++)
+                    out[outn++] = decins[k][q];
             }
         }
 
         if (op == OP_VARIABLE && wc >= 4 && o[2] == var_id) {
+            for (int k = 0; k < ntype; k++) {
+                uint32_t twc = typeins[k][0] >> 16;
+                PUSH((int)twc);
+                for (uint32_t q = 0; q < twc; q++)
+                    out[outn++] = typeins[k][q];
+            }
             PUSH(4);
             out[outn++] = (4u << 16) | OP_VARIABLE;
             out[outn++] = sb_ptr_id;
@@ -337,10 +372,9 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
             if (k < nloads)
                 continue;
         }
-        if (op == OP_IMAGE_FETCH && wc >= 5) {
+        if (op == OP_IMAGE_FETCH && wc >= 5 && fetch_vec) {
             uint32_t coord = o[4];
             uint32_t acc = NEWID();
-            uint32_t v8 = NEWID();
             uint32_t v32 = NEWID();
             PUSH(6 + 4 + 4 + 7);
             out[outn++] = (6u << 16) | OP_ACCESS_CHAIN;
@@ -349,14 +383,22 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
             out[outn++] = var_id;
             out[outn++] = zero_id;   /* the runtime array member */
             out[outn++] = coord;     /* the index into it */
-            out[outn++] = (4u << 16) | OP_LOAD;
-            out[outn++] = int8_id;
-            out[outn++] = v8;
-            out[outn++] = acc;
-            out[outn++] = (4u << 16) | OP_SCONVERT;
-            out[outn++] = comp_type;
-            out[outn++] = v32;
-            out[outn++] = v8;
+            if (use_int8) {
+                uint32_t v8 = NEWID();
+                out[outn++] = (4u << 16) | OP_LOAD;
+                out[outn++] = int8_id;
+                out[outn++] = v8;
+                out[outn++] = acc;
+                out[outn++] = (4u << 16) | OP_SCONVERT;
+                out[outn++] = comp_type;
+                out[outn++] = v32;
+                out[outn++] = v8;
+            } else {
+                out[outn++] = (4u << 16) | OP_LOAD;
+                out[outn++] = comp_type;
+                out[outn++] = v32;
+                out[outn++] = acc;
+            }
             out[outn++] = (7u << 16) | OP_COMPOSITE_CONSTRUCT;
             out[outn++] = fetch_vec;
             out[outn++] = o[2];   /* the original result id */
@@ -364,7 +406,6 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
             out[outn++] = v32;
             out[outn++] = v32;
             out[outn++] = v32;
-            nfetch++;
             continue;
         }
         PUSH(wc);
@@ -373,11 +414,6 @@ uint32_t *spv_texelbuf_to_storage(const uint32_t *code, size_t words, size_t *ou
     }
 #undef PUSH
 
-    if (!nfetch) {
-        free(out);
-        free(ins);
-        return NULL;
-    }
     /* the id bound grew while patching */
     out[3] = next_id;
 

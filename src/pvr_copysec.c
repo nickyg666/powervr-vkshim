@@ -31,6 +31,15 @@ static pthread_mutex_t cs_lck = PTHREAD_MUTEX_INITIALIZER;
 
 static void cs_log(const char *fmt, ...)
 {
+    static int dbg_init = 0;
+    static int dbg_on = 0;
+    if (!dbg_init) {
+        const char *e = getenv("VKC_DEBUG");
+        dbg_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        dbg_init = 1;
+    }
+    if (!dbg_on)
+        return;
     static long long count;
     long long i = ++count;
     if (i > 40)
@@ -45,15 +54,15 @@ static void cs_log(const char *fmt, ...)
         fprintf(f, "[copysec %lld] %s\n", i, msg);
         fclose(f);
     }
-    fprintf(stderr, "vkcompat[copysec %lld]: %s\n", i, msg);
 }
 
 /* ------------------------------------------------------------------ */
 /* command buffer tracking table                                       */
 /* ------------------------------------------------------------------ */
-#define TRACKN 256
+#define TRACKN 4096
 struct trec {
     VkCommandBuffer cb;
+    VkCommandPool pool;
     unsigned char in_pass;      /* recording inside a render pass */
     unsigned char is_secondary; /* the app allocated this as a secondary */
     unsigned char used;
@@ -70,6 +79,9 @@ static struct trec *t_find(VkCommandBuffer cb)
 
 static struct trec *t_alloc(VkCommandBuffer cb)
 {
+    struct trec *ex = t_find(cb);
+    if (ex)
+        return ex;
     for (int i = 0; i < TRACKN; i++)
         if (!table[i].used) {
             memset(&table[i], 0, sizeof(table[i]));
@@ -84,12 +96,13 @@ static struct trec *t_alloc(VkCommandBuffer cb)
 /* next-layer state                                                    */
 /* ------------------------------------------------------------------ */
 #define BATCH 64
-#define MAXBATCH 32
-#define OWNERMAX 64
+#define MAXBATCH 256
+#define OWNERMAX 512
 #define SECPERPRIMMAX 8192
 
 struct owner {
     VkCommandBuffer prim;
+    VkCommandPool pool;
     VkCommandBuffer *secs;
     int cnt;
     int cap;
@@ -133,8 +146,12 @@ static void cs_reclaim_owner(struct cs *s, struct owner *o);
 
 static int cs_envoff(void)
 {
-    const char *e = getenv("VKC_NO_COPYSEC");
-    return e && e[0] == '1';
+    static int cached = -1;
+    if (cached < 0) {
+        const char *no = getenv("VKC_NO_COPYSEC");
+        cached = (no && no[0] == '1') ? 1 : 0; /* default ON; pool-aware reset fixes the hang */
+    }
+    return cached;
 }
 
 void cs_bind(VkDevice dev, gdpfunc gd)
@@ -239,6 +256,8 @@ static struct owner *cs_owner_of(struct cs *s, VkCommandBuffer prim)
         cs_log("owner table full; recycled a primary slot");
     }
     o->prim = prim;
+    struct trec *tr = t_find(prim);
+    o->pool = tr ? tr->pool : VK_NULL_HANDLE;
     if (!o->secs) {
         o->cap = 16;
         o->secs = malloc((size_t)o->cap * sizeof(VkCommandBuffer));
@@ -260,6 +279,7 @@ static void cs_reclaim_owner(struct cs *s, struct owner *o)
     }
     o->cnt = 0;
     o->prim = VK_NULL_HANDLE;
+    o->pool = VK_NULL_HANDLE;
     free(o->secs);
     o->secs = NULL;
     o->cap = 0;
@@ -267,7 +287,7 @@ static void cs_reclaim_owner(struct cs *s, struct owner *o)
 
 void cs_track_begin(VkCommandBuffer cb)
 {
-    if (!CS.resolved)
+    if (!CS.resolved || cs_envoff())
         return;
     pthread_mutex_lock(&cs_lck);
     for (int i = 0; i < OWNERMAX; i++)
@@ -284,20 +304,22 @@ void cs_track_begin(VkCommandBuffer cb)
 void cs_track_alloc(VkDevice dev, const VkCommandBufferAllocateInfo *ai,
                     const VkCommandBuffer *cbs)
 {
-    if (!dev || dev != CS.dev || !ai || !cbs)
+    if (!dev || dev != CS.dev || !ai || !cbs || cs_envoff())
         return;
     pthread_mutex_lock(&cs_lck);
     for (uint32_t i = 0; i < ai->commandBufferCount; i++) {
         struct trec *t = t_alloc(cbs[i]);
-        if (t)
+        if (t) {
+            t->pool = ai->commandPool;
             t->is_secondary = (ai->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+        }
     }
     pthread_mutex_unlock(&cs_lck);
 }
 
 void cs_track_free(VkDevice dev, uint32_t n, const VkCommandBuffer *cbs)
 {
-    if (!dev || dev != CS.dev || !cbs)
+    if (!dev || dev != CS.dev || !cbs || cs_envoff())
         return;
     pthread_mutex_lock(&cs_lck);
     for (uint32_t i = 0; i < n; i++) {
@@ -309,6 +331,7 @@ void cs_track_free(VkDevice dev, uint32_t n, const VkCommandBuffer *cbs)
         struct trec *t = t_find(cbs[i]);
         if (t) {
             t->used = 0;
+            t->pool = VK_NULL_HANDLE;
             t->in_pass = 0;
         }
     }
@@ -317,7 +340,7 @@ void cs_track_free(VkDevice dev, uint32_t n, const VkCommandBuffer *cbs)
 
 void cs_track_reset(VkCommandBuffer cb)
 {
-    if (!CS.resolved)
+    if (!CS.resolved || cs_envoff())
         return;
     pthread_mutex_lock(&cs_lck);
     for (int i = 0; i < OWNERMAX; i++)
@@ -325,18 +348,61 @@ void cs_track_reset(VkCommandBuffer cb)
             cs_reclaim_owner(&CS, &CS.owners[i]);
             break;
         }
+    struct trec *t = t_find(cb);
+    if (t)
+        t->in_pass = 0;
     pthread_mutex_unlock(&cs_lck);
 }
 
 void cs_track_resetpool(VkDevice dev, VkCommandPool pool)
 {
-    if (!dev || dev != CS.dev || !pool)
+    if (!dev || dev != CS.dev || !pool || cs_envoff())
         return;
-    /* a pool reset invalidates every cmdbuf recorded from it */
+    /* Only reclaim primary command buffers belonging to THIS pool.
+     * Reclaiming other pools corrupts secondary command buffers that are
+     * currently executing on the GPU in another frame's command pool! */
     pthread_mutex_lock(&cs_lck);
-    for (int i = 0; i < OWNERMAX; i++)
-        if (CS.owners[i].secs)
+    for (int i = 0; i < OWNERMAX; i++) {
+        if (!CS.owners[i].secs)
+            continue;
+        VkCommandPool opool = CS.owners[i].pool;
+        if (!opool) {
+            struct trec *t = t_find(CS.owners[i].prim);
+            if (t)
+                opool = t->pool;
+        }
+        if (opool == pool)
             cs_reclaim_owner(&CS, &CS.owners[i]);
+    }
+    for (int i = 0; i < TRACKN; i++)
+        if (table[i].used && table[i].pool == pool)
+            table[i].in_pass = 0;
+    pthread_mutex_unlock(&cs_lck);
+}
+
+void cs_track_destroypool(VkDevice dev, VkCommandPool pool)
+{
+    if (!dev || dev != CS.dev || !pool || cs_envoff())
+        return;
+    pthread_mutex_lock(&cs_lck);
+    for (int i = 0; i < OWNERMAX; i++) {
+        if (!CS.owners[i].secs)
+            continue;
+        VkCommandPool opool = CS.owners[i].pool;
+        if (!opool) {
+            struct trec *t = t_find(CS.owners[i].prim);
+            if (t)
+                opool = t->pool;
+        }
+        if (opool == pool)
+            cs_reclaim_owner(&CS, &CS.owners[i]);
+    }
+    for (int i = 0; i < TRACKN; i++)
+        if (table[i].used && table[i].pool == pool) {
+            table[i].used = 0;
+            table[i].pool = VK_NULL_HANDLE;
+            table[i].in_pass = 0;
+        }
     pthread_mutex_unlock(&cs_lck);
 }
 
