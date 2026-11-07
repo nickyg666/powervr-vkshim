@@ -118,20 +118,52 @@ static void segv_handler(int sig, siginfo_t *si, void *ctx)
 static PFN_vkGetInstanceProcAddr next_gipa;
 static PFN_vkGetDeviceProcAddr next_gdpa;
 static VkPhysicalDevice g_pd = VK_NULL_HANDLE;
-/* view -> image map for the dump */
-static VkImageView g_viewmap[512];
-static VkImage   g_viewimgs[512];
+/* view -> image map for render pass attachment tracking */
+#define VIEWMAP_MAX 4096
+static VkImageView g_viewmap[VIEWMAP_MAX];
+static VkImage   g_viewimgs[VIEWMAP_MAX];
 static int       g_viewn;
+static int       g_view_next;
+static pthread_mutex_t g_view_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int       g_rt_done;
 static int       g_ubo_done;
 static int       g_rt_big_done;
 
 void *vimg(void *view)
 {
-    for (int i = 0; i < g_viewn; i++)
-        if (g_viewmap[i] == view)
-            return g_viewimgs[i];
-    return NULL;
+    if (!view)
+        return NULL;
+    void *res = NULL;
+    pthread_mutex_lock(&g_view_mtx);
+    for (int i = g_viewn - 1; i >= 0; i--) {
+        if (g_viewmap[i] == (VkImageView)view) {
+            res = (void *)g_viewimgs[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_view_mtx);
+    return res;
+}
+
+static void vimg_record(VkImageView view, VkImage image)
+{
+    if (!view || !image)
+        return;
+    pthread_mutex_lock(&g_view_mtx);
+    for (int i = 0; i < g_viewn; i++) {
+        if (g_viewmap[i] == view) {
+            g_viewimgs[i] = image;
+            pthread_mutex_unlock(&g_view_mtx);
+            return;
+        }
+    }
+    int idx = g_view_next % VIEWMAP_MAX;
+    g_viewmap[idx] = view;
+    g_viewimgs[idx] = image;
+    g_view_next++;
+    if (g_viewn < VIEWMAP_MAX)
+        g_viewn++;
+    pthread_mutex_unlock(&g_view_mtx);
 }
 
 /* atlas dump via worker thread (avoids allocating during command recording) */
@@ -1296,11 +1328,305 @@ static void VKAPI_CALL wrapped_DestroyInstance(VkInstance instance,
 
 static void resolve_copyfns(void);
 
+static VkResult VKAPI_CALL wrapped_EnumerateDeviceExtensionProperties(
+    VkPhysicalDevice physicalDevice, const char *pLayerName,
+    uint32_t *pPropertyCount, VkExtensionProperties *pProperties)
+{
+    static const char *const extra_exts[] = {
+        "VK_EXT_robustness2",
+        "VK_EXT_transform_feedback",
+    };
+    const uint32_t nextra = 2;
+
+    if (pLayerName && strcmp(pLayerName, "VK_LAYER_powervr_compat") == 0) {
+        if (!pPropertyCount)
+            return VK_INCOMPLETE;
+        if (!pProperties) {
+            *pPropertyCount = nextra;
+            return VK_SUCCESS;
+        }
+        uint32_t cap = *pPropertyCount;
+        uint32_t n = cap < nextra ? cap : nextra;
+        for (uint32_t i = 0; i < n; i++) {
+            memset(&pProperties[i], 0, sizeof(pProperties[i]));
+            strncpy(pProperties[i].extensionName, extra_exts[i],
+                    VK_MAX_EXTENSION_NAME_SIZE - 1);
+            pProperties[i].specVersion = 1;
+        }
+        *pPropertyCount = n;
+        return n < nextra ? VK_INCOMPLETE : VK_SUCCESS;
+    }
+
+    PFN_vkEnumerateDeviceExtensionProperties fn = NULL;
+#ifdef AS_LAYER
+    if (next_gipa)
+        fn = (PFN_vkEnumerateDeviceExtensionProperties)next_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkEnumerateDeviceExtensionProperties");
+#endif
+    if (!fn && g_drv_gipa)
+        fn = (PFN_vkEnumerateDeviceExtensionProperties)g_drv_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkEnumerateDeviceExtensionProperties");
+    if (!fn)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    if (!pProperties) {
+        VkResult r = fn(physicalDevice, pLayerName, pPropertyCount, NULL);
+        if (r == VK_SUCCESS && pPropertyCount)
+            (*pPropertyCount) += nextra;
+        return r;
+    }
+
+    uint32_t cap = *pPropertyCount;
+    uint32_t cnt = cap > nextra ? cap - nextra : 0;
+    VkResult r = fn(physicalDevice, pLayerName, &cnt, pProperties);
+    for (uint32_t e = 0; e < nextra; e++) {
+        int found = 0;
+        for (uint32_t i = 0; i < cnt; i++) {
+            if (strcmp(pProperties[i].extensionName, extra_exts[e]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (cnt < cap) {
+                memset(&pProperties[cnt], 0, sizeof(pProperties[cnt]));
+                strncpy(pProperties[cnt].extensionName, extra_exts[e],
+                        VK_MAX_EXTENSION_NAME_SIZE - 1);
+                pProperties[cnt].specVersion = 1;
+                cnt++;
+            } else {
+                r = VK_INCOMPLETE;
+            }
+        }
+    }
+    *pPropertyCount = cnt;
+    return r;
+}
+
+typedef struct VkPhysicalDeviceRobustness2FeaturesEXT_local {
+    VkStructureType sType;
+    void *pNext;
+    VkBool32 robustBufferAccess2;
+    VkBool32 robustImageAccess2;
+    VkBool32 nullDescriptor;
+} VkPhysicalDeviceRobustness2FeaturesEXT_local;
+
+typedef struct VkPhysicalDeviceRobustness2PropertiesEXT_local {
+    VkStructureType sType;
+    void *pNext;
+    VkDeviceSize robustStorageBufferAccessSizeAlignment;
+    VkDeviceSize robustUniformBufferAccessSizeAlignment;
+} VkPhysicalDeviceRobustness2PropertiesEXT_local;
+
+typedef struct VkPhysicalDeviceTransformFeedbackFeaturesEXT_local {
+    VkStructureType sType;
+    void *pNext;
+    VkBool32 transformFeedback;
+    VkBool32 geometryStreams;
+} VkPhysicalDeviceTransformFeedbackFeaturesEXT_local;
+
+typedef struct VkPhysicalDeviceTransformFeedbackPropertiesEXT_local {
+    VkStructureType sType;
+    void *pNext;
+    uint32_t maxTransformFeedbackStreams;
+    uint32_t maxTransformFeedbackBuffers;
+    VkDeviceSize maxTransformFeedbackBufferSize;
+    uint32_t maxTransformFeedbackStreamDataSize;
+    uint32_t maxTransformFeedbackBufferDataSize;
+    uint32_t maxTransformFeedbackBufferDataStride;
+    VkBool32 transformFeedbackQueries;
+    VkBool32 transformFeedbackStreamsLinesTriangles;
+    VkBool32 transformFeedbackRasterizationStreamSelect;
+    VkBool32 transformFeedbackDraw;
+} VkPhysicalDeviceTransformFeedbackPropertiesEXT_local;
+
+#define VKC_STRUCTURE_TYPE_ROBUSTNESS_2_FEATURES_EXT ((VkStructureType)1000286000)
+#define VKC_STRUCTURE_TYPE_ROBUSTNESS_2_PROPERTIES_EXT ((VkStructureType)1000286001)
+#define VKC_STRUCTURE_TYPE_TRANSFORM_FEEDBACK_FEATURES_EXT ((VkStructureType)1000028000)
+#define VKC_STRUCTURE_TYPE_TRANSFORM_FEEDBACK_PROPERTIES_EXT ((VkStructureType)1000028001)
+
+static void VKAPI_CALL wrapped_GetPhysicalDeviceFeatures2(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures)
+{
+    PFN_vkGetPhysicalDeviceFeatures2 fn = NULL;
+#ifdef AS_LAYER
+    if (next_gipa) {
+        fn = (PFN_vkGetPhysicalDeviceFeatures2)next_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceFeatures2");
+        if (!fn)
+            fn = (PFN_vkGetPhysicalDeviceFeatures2)next_gipa(
+                layer_instance ? layer_instance : VK_NULL_HANDLE,
+                "vkGetPhysicalDeviceFeatures2KHR");
+    }
+#endif
+    if (!fn && g_drv_gipa) {
+        fn = (PFN_vkGetPhysicalDeviceFeatures2)g_drv_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceFeatures2");
+        if (!fn)
+            fn = (PFN_vkGetPhysicalDeviceFeatures2)g_drv_gipa(
+                layer_instance ? layer_instance : VK_NULL_HANDLE,
+                "vkGetPhysicalDeviceFeatures2KHR");
+    }
+    if (fn)
+        fn(physicalDevice, pFeatures);
+    if (!pFeatures)
+        return;
+    for (VkBaseOutStructure *p = (VkBaseOutStructure *)pFeatures->pNext; p; p = p->pNext) {
+        if (p->sType == VKC_STRUCTURE_TYPE_ROBUSTNESS_2_FEATURES_EXT) {
+            VkPhysicalDeviceRobustness2FeaturesEXT_local *rf =
+                (VkPhysicalDeviceRobustness2FeaturesEXT_local *)p;
+            rf->robustBufferAccess2 = VK_TRUE;
+            rf->robustImageAccess2 = VK_TRUE;
+            rf->nullDescriptor = VK_TRUE;
+        } else if (p->sType == VKC_STRUCTURE_TYPE_TRANSFORM_FEEDBACK_FEATURES_EXT) {
+            VkPhysicalDeviceTransformFeedbackFeaturesEXT_local *tf =
+                (VkPhysicalDeviceTransformFeedbackFeaturesEXT_local *)p;
+            tf->transformFeedback = VK_TRUE;
+            tf->geometryStreams = VK_TRUE;
+        }
+    }
+}
+
+static void VKAPI_CALL wrapped_GetPhysicalDeviceProperties2(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties)
+{
+    PFN_vkGetPhysicalDeviceProperties2 fn = NULL;
+#ifdef AS_LAYER
+    if (next_gipa) {
+        fn = (PFN_vkGetPhysicalDeviceProperties2)next_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceProperties2");
+        if (!fn)
+            fn = (PFN_vkGetPhysicalDeviceProperties2)next_gipa(
+                layer_instance ? layer_instance : VK_NULL_HANDLE,
+                "vkGetPhysicalDeviceProperties2KHR");
+    }
+#endif
+    if (!fn && g_drv_gipa) {
+        fn = (PFN_vkGetPhysicalDeviceProperties2)g_drv_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceProperties2");
+        if (!fn)
+            fn = (PFN_vkGetPhysicalDeviceProperties2)g_drv_gipa(
+                layer_instance ? layer_instance : VK_NULL_HANDLE,
+                "vkGetPhysicalDeviceProperties2KHR");
+    }
+    if (fn)
+        fn(physicalDevice, pProperties);
+    if (!pProperties)
+        return;
+    for (VkBaseOutStructure *p = (VkBaseOutStructure *)pProperties->pNext; p; p = p->pNext) {
+        if (p->sType == VKC_STRUCTURE_TYPE_ROBUSTNESS_2_PROPERTIES_EXT) {
+            VkPhysicalDeviceRobustness2PropertiesEXT_local *rp =
+                (VkPhysicalDeviceRobustness2PropertiesEXT_local *)p;
+            rp->robustStorageBufferAccessSizeAlignment = 4;
+            rp->robustUniformBufferAccessSizeAlignment = 16;
+        } else if (p->sType == VKC_STRUCTURE_TYPE_TRANSFORM_FEEDBACK_PROPERTIES_EXT) {
+            VkPhysicalDeviceTransformFeedbackPropertiesEXT_local *tp =
+                (VkPhysicalDeviceTransformFeedbackPropertiesEXT_local *)p;
+            tp->maxTransformFeedbackStreams = 4;
+            tp->maxTransformFeedbackBuffers = 4;
+            tp->maxTransformFeedbackBufferSize = 0x10000000ULL;
+            tp->maxTransformFeedbackStreamDataSize = 512;
+            tp->maxTransformFeedbackBufferDataSize = 512;
+            tp->maxTransformFeedbackBufferDataStride = 512;
+            tp->transformFeedbackQueries = VK_TRUE;
+            tp->transformFeedbackStreamsLinesTriangles = VK_TRUE;
+            tp->transformFeedbackRasterizationStreamSelect = VK_TRUE;
+            tp->transformFeedbackDraw = VK_TRUE;
+        }
+    }
+}
+
+static void VKAPI_CALL noop_CmdBindTransformFeedbackBuffersEXT(
+    VkCommandBuffer cb, uint32_t firstBinding, uint32_t bindingCount,
+    const VkBuffer *pBuffers, const VkDeviceSize *pOffsets, const VkDeviceSize *pSizes)
+{
+    (void)cb; (void)firstBinding; (void)bindingCount;
+    (void)pBuffers; (void)pOffsets; (void)pSizes;
+}
+
+static void VKAPI_CALL noop_CmdBeginTransformFeedbackEXT(
+    VkCommandBuffer cb, uint32_t firstCounterBuffer, uint32_t counterBufferCount,
+    const VkBuffer *pCounterBuffers, const VkDeviceSize *pCounterBufferOffsets)
+{
+    (void)cb; (void)firstCounterBuffer; (void)counterBufferCount;
+    (void)pCounterBuffers; (void)pCounterBufferOffsets;
+}
+
+static void VKAPI_CALL noop_CmdEndTransformFeedbackEXT(
+    VkCommandBuffer cb, uint32_t firstCounterBuffer, uint32_t counterBufferCount,
+    const VkBuffer *pCounterBuffers, const VkDeviceSize *pCounterBufferOffsets)
+{
+    (void)cb; (void)firstCounterBuffer; (void)counterBufferCount;
+    (void)pCounterBuffers; (void)pCounterBufferOffsets;
+}
+
+static void VKAPI_CALL noop_CmdBeginQueryIndexedEXT(
+    VkCommandBuffer cb, VkQueryPool queryPool, uint32_t query,
+    VkQueryControlFlags flags, uint32_t index)
+{
+    (void)cb; (void)queryPool; (void)query; (void)flags; (void)index;
+}
+
+static void VKAPI_CALL noop_CmdEndQueryIndexedEXT(
+    VkCommandBuffer cb, VkQueryPool queryPool, uint32_t query, uint32_t index)
+{
+    (void)cb; (void)queryPool; (void)query; (void)index;
+}
+
+static void VKAPI_CALL noop_CmdDrawIndirectByteCountEXT(
+    VkCommandBuffer cb, uint32_t instanceCount, uint32_t firstInstance,
+    VkBuffer counterBuffer, VkDeviceSize counterBufferOffset,
+    uint32_t counterOffset, uint32_t vertexStride)
+{
+    (void)cb; (void)instanceCount; (void)firstInstance;
+    (void)counterBuffer; (void)counterBufferOffset;
+    (void)counterOffset; (void)vertexStride;
+}
+
 static VkResult VKAPI_CALL wrapped_CreateDevice(VkPhysicalDevice physicalDevice,
                                                 const VkDeviceCreateInfo *pCreateInfo,
                                                 const VkAllocationCallbacks *pAllocator,
                                                 VkDevice *pDevice)
 {
+    VkDeviceCreateInfo ci_copy;
+    const char *filtered_exts[256];
+    if (pCreateInfo && pCreateInfo->enabledExtensionCount > 0 &&
+        pCreateInfo->enabledExtensionCount <= 256 && pCreateInfo->ppEnabledExtensionNames) {
+        ci_copy = *pCreateInfo;
+        uint32_t new_cnt = 0;
+        for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
+            if (pCreateInfo->ppEnabledExtensionNames[i] &&
+                (strcmp(pCreateInfo->ppEnabledExtensionNames[i], "VK_EXT_robustness2") == 0 ||
+                 strcmp(pCreateInfo->ppEnabledExtensionNames[i], "VK_EXT_transform_feedback") == 0))
+                continue;
+            filtered_exts[new_cnt++] = pCreateInfo->ppEnabledExtensionNames[i];
+        }
+        ci_copy.enabledExtensionCount = new_cnt;
+        ci_copy.ppEnabledExtensionNames = filtered_exts;
+        pCreateInfo = &ci_copy;
+    }
+    if (pCreateInfo) {
+        for (VkBaseOutStructure *p = (VkBaseOutStructure *)pCreateInfo->pNext; p; p = p->pNext) {
+            if (p->sType == VKC_STRUCTURE_TYPE_ROBUSTNESS_2_FEATURES_EXT) {
+                VkPhysicalDeviceRobustness2FeaturesEXT_local *rf =
+                    (VkPhysicalDeviceRobustness2FeaturesEXT_local *)p;
+                rf->robustBufferAccess2 = VK_FALSE;
+                rf->robustImageAccess2 = VK_FALSE;
+                rf->nullDescriptor = VK_FALSE;
+            } else if (p->sType == VKC_STRUCTURE_TYPE_TRANSFORM_FEEDBACK_FEATURES_EXT) {
+                VkPhysicalDeviceTransformFeedbackFeaturesEXT_local *tf =
+                    (VkPhysicalDeviceTransformFeedbackFeaturesEXT_local *)p;
+                tf->transformFeedback = VK_FALSE;
+                tf->geometryStreams = VK_FALSE;
+            }
+        }
+    }
 #ifdef AS_LAYER
     {
         const VkLayerDeviceCreateInfo *link =
@@ -2161,10 +2487,8 @@ static VkResult VKAPI_CALL wrapped_CreateImageView(VkDevice device,
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (real_CreateImageView)
         r = real_CreateImageView(device, pCreateInfo, pAllocator, pView);
-    if (r == VK_SUCCESS && pView && g_viewn < 512) {
-        g_viewmap[g_viewn] = *pView;
-        g_viewimgs[g_viewn] = pCreateInfo->image;
-        g_viewn++;
+    if (r == VK_SUCCESS && pView && pCreateInfo) {
+        vimg_record(*pView, pCreateInfo->image);
     }
     if (r == VK_SUCCESS && pCreateInfo && getenv("VKC_LOG_IMAGES"))
         LOG("image view %p: image=%p format=%d type=%d aspect=0x%x baseMip=%u levelCount=%u baseLayer=%u layerCount=%u",
@@ -2307,6 +2631,119 @@ static PFN_vkCmdEndRendering real_CmdEndRendering;
 static PFN_vkCmdPipelineBarrier real_CmdPipelineBarrier;
 static PFN_vkQueueSubmit2KHR real_QueueSubmit2KHR;
 static PFN_vkWaitSemaphores real_WaitSemaphores;
+static PFN_vkCmdClearColorImage real_CmdClearColorImage;
+static PFN_vkCmdClearDepthStencilImage real_CmdClearDepthStencilImage;
+static PFN_vkEndCommandBuffer real_EndCommandBuffer;
+
+#define MAX_PENDING_CLEARS 64
+struct pending_clear {
+    int used;
+    VkCommandBuffer cb;
+    VkImage image;
+    VkImageLayout layout;
+    int is_depth;
+    VkClearColorValue color;
+    VkClearDepthStencilValue depth;
+    VkImageSubresourceRange range;
+};
+static struct pending_clear g_pclears[MAX_PENDING_CLEARS];
+static pthread_mutex_t g_pclear_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void pclear_reset_cb(VkCommandBuffer cb)
+{
+    pthread_mutex_lock(&g_pclear_mtx);
+    for (int i = 0; i < MAX_PENDING_CLEARS; i++) {
+        if (g_pclears[i].used && g_pclears[i].cb == cb)
+            g_pclears[i].used = 0;
+    }
+    pthread_mutex_unlock(&g_pclear_mtx);
+}
+
+static void pclear_reset_all(void)
+{
+    pthread_mutex_lock(&g_pclear_mtx);
+    memset(g_pclears, 0, sizeof(g_pclears));
+    pthread_mutex_unlock(&g_pclear_mtx);
+}
+
+static void pclear_add_color(VkCommandBuffer cb, VkImage image, VkImageLayout layout,
+                             const VkClearColorValue *color, const VkImageSubresourceRange *range)
+{
+    pthread_mutex_lock(&g_pclear_mtx);
+    int slot = -1;
+    for (int i = 0; i < MAX_PENDING_CLEARS; i++) {
+        if (g_pclears[i].used && g_pclears[i].cb == cb &&
+            g_pclears[i].image == image && !g_pclears[i].is_depth) {
+            slot = i;
+            break;
+        }
+        if (!g_pclears[i].used && slot < 0)
+            slot = i;
+    }
+    if (slot >= 0) {
+        g_pclears[slot].used = 1;
+        g_pclears[slot].cb = cb;
+        g_pclears[slot].image = image;
+        g_pclears[slot].layout = layout;
+        g_pclears[slot].is_depth = 0;
+        g_pclears[slot].color = *color;
+        g_pclears[slot].range = *range;
+    }
+    pthread_mutex_unlock(&g_pclear_mtx);
+}
+
+static void pclear_add_depth(VkCommandBuffer cb, VkImage image, VkImageLayout layout,
+                             const VkClearDepthStencilValue *depth, const VkImageSubresourceRange *range)
+{
+    pthread_mutex_lock(&g_pclear_mtx);
+    int slot = -1;
+    for (int i = 0; i < MAX_PENDING_CLEARS; i++) {
+        if (g_pclears[i].used && g_pclears[i].cb == cb &&
+            g_pclears[i].image == image && g_pclears[i].is_depth) {
+            slot = i;
+            break;
+        }
+        if (!g_pclears[i].used && slot < 0)
+            slot = i;
+    }
+    if (slot >= 0) {
+        g_pclears[slot].used = 1;
+        g_pclears[slot].cb = cb;
+        g_pclears[slot].image = image;
+        g_pclears[slot].layout = layout;
+        g_pclears[slot].is_depth = 1;
+        g_pclears[slot].depth = *depth;
+        g_pclears[slot].range = *range;
+    }
+    pthread_mutex_unlock(&g_pclear_mtx);
+}
+
+static void pclear_flush_image(VkCommandBuffer cb, VkImage image)
+{
+    struct pending_clear to_flush[2];
+    int nflush = 0;
+    pthread_mutex_lock(&g_pclear_mtx);
+    for (int i = 0; i < MAX_PENDING_CLEARS; i++) {
+        if (g_pclears[i].used && g_pclears[i].cb == cb &&
+            (image == VK_NULL_HANDLE || g_pclears[i].image == image)) {
+            if (nflush < 2)
+                to_flush[nflush++] = g_pclears[i];
+            g_pclears[i].used = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_pclear_mtx);
+    for (int i = 0; i < nflush; i++) {
+        if (to_flush[i].is_depth) {
+            if (real_CmdClearDepthStencilImage)
+                real_CmdClearDepthStencilImage(cb, to_flush[i].image, to_flush[i].layout,
+                                               &to_flush[i].depth, 1, &to_flush[i].range);
+        } else {
+            if (real_CmdClearColorImage)
+                real_CmdClearColorImage(cb, to_flush[i].image, to_flush[i].layout,
+                                        &to_flush[i].color, 1, &to_flush[i].range);
+        }
+    }
+}
 
 static void resolve_copyfns(void)
 {
@@ -2320,6 +2757,9 @@ static void resolve_copyfns(void)
     RQ(CmdCopyImageToBuffer);
     RQ(CmdBlitImage);
     RQ(CmdPipelineBarrier);
+    RQ(CmdClearColorImage);
+    RQ(CmdClearDepthStencilImage);
+    RQ(EndCommandBuffer);
     real_QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)(next_gdpa ? next_gdpa(g_dev, "vkQueueSubmit2KHR") : dev_lookup("vkQueueSubmit2KHR"));
     if (!real_QueueSubmit2KHR)
         real_QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)(next_gdpa ? next_gdpa(g_dev, "vkQueueSubmit2") : dev_lookup("vkQueueSubmit2"));
@@ -2424,6 +2864,7 @@ static void VKAPI_CALL wrapped_CmdBlitImage(VkCommandBuffer cb, VkImage src,
     }
     if (blit_copysec && cs_route_blit(cb, src, sl, dst, dl, n, r, f))
         return;
+    pclear_flush_image(cb, src);
     emit_blit_barrier(cb);
     if (real_CmdBlitImage)
         real_CmdBlitImage(cb, src, sl, dst, dl, n, r, f);
@@ -2517,6 +2958,7 @@ static VkResult VKAPI_CALL wrapped_BeginCommandBuffer(
     resolve_device();
     resolve_copyfns();
     cs_track_begin(cb);
+    pclear_reset_cb(cb);
     { static int dbgN; if (++dbgN <= 3) DBG("begin #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
     if (g_debug && (g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
         DBG("DUMPING atlas.ppm");
@@ -2542,6 +2984,7 @@ static void VKAPI_CALL wrapped_ResetCommandBuffer(VkCommandBuffer cb,
     resolve_device();
     resolve_copyfns();
     cs_track_reset(cb);
+    pclear_reset_cb(cb);
     { static int dbgN; if (++dbgN <= 3) DBG("reset #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
     if (g_debug && (g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
         FILE *f = fopen("/tmp/atlas.ppm", "wb");
@@ -2566,6 +3009,7 @@ static void VKAPI_CALL wrapped_ResetCommandPool(VkDevice device,
     resolve_device();
     resolve_copyfns();
     cs_track_resetpool(device, pool);
+    pclear_reset_all();
     if (real_ResetCommandPool)
         real_ResetCommandPool(device, pool, f);
 }
@@ -2617,13 +3061,151 @@ static void VKAPI_CALL wrapped_CmdEndRenderPass2Tracking(
         real_CmdEndRenderPass2(cb, i);
 }
 
+static void VKAPI_CALL wrapped_CmdClearColorImage(
+    VkCommandBuffer cb, VkImage image, VkImageLayout imageLayout,
+    const VkClearColorValue *pColor, uint32_t rangeCount,
+    const VkImageSubresourceRange *pRanges)
+{
+    resolve_device();
+    resolve_copyfns();
+    static int fold_clear = -1;
+    if (fold_clear < 0) {
+        const char *e = getenv("VKC_NO_FOLD_CLEAR");
+        fold_clear = (e && e[0] == '1') ? 0 : 1;
+    }
+    if (fold_clear && !cs_in_pass(cb) && pColor && rangeCount == 1 && pRanges) {
+        pclear_add_color(cb, image, imageLayout, pColor, &pRanges[0]);
+        return;
+    }
+    if (real_CmdClearColorImage)
+        real_CmdClearColorImage(cb, image, imageLayout, pColor, rangeCount, pRanges);
+}
+
+static void VKAPI_CALL wrapped_CmdClearDepthStencilImage(
+    VkCommandBuffer cb, VkImage image, VkImageLayout imageLayout,
+    const VkClearDepthStencilValue *pDepthStencil, uint32_t rangeCount,
+    const VkImageSubresourceRange *pRanges)
+{
+    resolve_device();
+    resolve_copyfns();
+    static int fold_clear = -1;
+    if (fold_clear < 0) {
+        const char *e = getenv("VKC_NO_FOLD_CLEAR");
+        fold_clear = (e && e[0] == '1') ? 0 : 1;
+    }
+    if (fold_clear && !cs_in_pass(cb) && pDepthStencil && rangeCount == 1 && pRanges) {
+        pclear_add_depth(cb, image, imageLayout, pDepthStencil, &pRanges[0]);
+        return;
+    }
+    if (real_CmdClearDepthStencilImage)
+        real_CmdClearDepthStencilImage(cb, image, imageLayout, pDepthStencil, rangeCount, pRanges);
+}
+
+static VkResult VKAPI_CALL wrapped_EndCommandBuffer(VkCommandBuffer cb)
+{
+    resolve_device();
+    resolve_copyfns();
+    pclear_flush_image(cb, VK_NULL_HANDLE);
+    if (real_EndCommandBuffer)
+        return real_EndCommandBuffer(cb);
+    return VK_ERROR_INITIALIZATION_FAILED;
+}
+
 static void VKAPI_CALL wrapped_CmdBeginRenderingTracking(
     VkCommandBuffer cb, const VkRenderingInfo *i)
 {
     resolve_copyfns();
+    if (!i) {
+        cs_track_beginpass(cb);
+        if (real_CmdBeginRendering)
+            real_CmdBeginRendering(cb, i);
+        return;
+    }
+
+    VkRenderingInfo ri = *i;
+    VkRenderingAttachmentInfo color_atts[8];
+    VkRenderingAttachmentInfo depth_att;
+    int modified = 0;
+    int full_area = (i->renderArea.offset.x == 0 && i->renderArea.offset.y == 0);
+
+    if (i->colorAttachmentCount > 0 && i->colorAttachmentCount <= 8 && i->pColorAttachments) {
+        memcpy(color_atts, i->pColorAttachments,
+               i->colorAttachmentCount * sizeof(VkRenderingAttachmentInfo));
+        for (uint32_t k = 0; k < i->colorAttachmentCount; k++) {
+            VkImage img = (VkImage)vimg((void *)color_atts[k].imageView);
+            if (!img)
+                continue;
+            if (!full_area && color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                pclear_flush_image(cb, img);
+                continue;
+            }
+            pthread_mutex_lock(&g_pclear_mtx);
+            for (int p = 0; p < MAX_PENDING_CLEARS; p++) {
+                if (g_pclears[p].used && g_pclears[p].cb == cb &&
+                    g_pclears[p].image == img && !g_pclears[p].is_depth) {
+                    if (color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                        color_atts[k].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                        color_atts[k].clearValue.color = g_pclears[p].color;
+                        modified = 1;
+                    }
+                    g_pclears[p].used = 0;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_pclear_mtx);
+        }
+        if (modified)
+            ri.pColorAttachments = color_atts;
+    }
+
+    if (i->pDepthAttachment && i->pDepthAttachment->imageView) {
+        depth_att = *i->pDepthAttachment;
+        VkImage img = (VkImage)vimg((void *)depth_att.imageView);
+        if (img) {
+            if (!full_area && depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                pclear_flush_image(cb, img);
+            } else {
+                pthread_mutex_lock(&g_pclear_mtx);
+                for (int p = 0; p < MAX_PENDING_CLEARS; p++) {
+                    if (g_pclears[p].used && g_pclears[p].cb == cb &&
+                        g_pclears[p].image == img && g_pclears[p].is_depth) {
+                        if (depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                            depth_att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                            depth_att.clearValue.depthStencil = g_pclears[p].depth;
+                            ri.pDepthAttachment = &depth_att;
+                            modified = 1;
+                        }
+                        g_pclears[p].used = 0;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_pclear_mtx);
+            }
+        }
+    }
+
+    /* Flush any remaining pending color clears on this command buffer in case
+     * the cleared texture is sampled by this render pass. */
+    struct pending_clear extra[8];
+    int nextra = 0;
+    pthread_mutex_lock(&g_pclear_mtx);
+    for (int p = 0; p < MAX_PENDING_CLEARS; p++) {
+        if (g_pclears[p].used && g_pclears[p].cb == cb && !g_pclears[p].is_depth) {
+            if (nextra < 8)
+                extra[nextra++] = g_pclears[p];
+            g_pclears[p].used = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_pclear_mtx);
+    for (int p = 0; p < nextra; p++) {
+        if (real_CmdClearColorImage)
+            real_CmdClearColorImage(cb, extra[p].image, extra[p].layout,
+                                    &extra[p].color, 1, &extra[p].range);
+    }
+
     cs_track_beginpass(cb);
     if (real_CmdBeginRendering)
-        real_CmdBeginRendering(cb, i);
+        real_CmdBeginRendering(cb, modified ? &ri : i);
 }
 
 static void VKAPI_CALL wrapped_CmdEndRenderingTracking(VkCommandBuffer cb)
@@ -2799,6 +3381,58 @@ static void rewrite_texel_buffers(VkWriteDescriptorSet *w, uint32_t count,
     }
 }
 
+static int desc_write_is_null(const VkWriteDescriptorSet *w)
+{
+    if (!w || w->descriptorCount == 0)
+        return 1;
+    switch (w->descriptorType) {
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+        if (!w->pBufferInfo)
+            return 1;
+        for (uint32_t i = 0; i < w->descriptorCount; i++)
+            if (w->pBufferInfo[i].buffer == VK_NULL_HANDLE)
+                return 1;
+        return 0;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        if (!w->pTexelBufferView)
+            return 1;
+        for (uint32_t i = 0; i < w->descriptorCount; i++)
+            if (w->pTexelBufferView[i] == VK_NULL_HANDLE)
+                return 1;
+        return 0;
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        if (!w->pImageInfo)
+            return 1;
+        for (uint32_t i = 0; i < w->descriptorCount; i++)
+            if (w->pImageInfo[i].imageView == VK_NULL_HANDLE)
+                return 1;
+        return 0;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        if (!w->pImageInfo)
+            return 1;
+        for (uint32_t i = 0; i < w->descriptorCount; i++)
+            if (w->pImageInfo[i].imageView == VK_NULL_HANDLE ||
+                w->pImageInfo[i].sampler == VK_NULL_HANDLE)
+                return 1;
+        return 0;
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+        if (!w->pImageInfo)
+            return 1;
+        for (uint32_t i = 0; i < w->descriptorCount; i++)
+            if (w->pImageInfo[i].sampler == VK_NULL_HANDLE)
+                return 1;
+        return 0;
+    default:
+        return 0;
+    }
+}
+
 static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
                                                        uint32_t pipelineBindPoint,
                                                        VkPipelineLayout layout,
@@ -2808,15 +3442,16 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
 {
     resolve_device();
     int has_texel = 0;
+    int has_null = 0;
     if (pDescriptorWrites) {
         for (uint32_t i = 0; i < descriptorWriteCount; i++) {
-            if (pDescriptorWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+            if (pDescriptorWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER)
                 has_texel = 1;
-                break;
-            }
+            if (desc_write_is_null(&pDescriptorWrites[i]))
+                has_null = 1;
         }
     }
-    if (!has_texel && !g_debug) {
+    if (!has_texel && !has_null && !g_debug) {
         if (real_CmdPushDescriptorSetKHR)
             real_CmdPushDescriptorSetKHR(commandBuffer, pipelineBindPoint, layout, set,
                                          descriptorWriteCount, pDescriptorWrites);
@@ -2826,13 +3461,20 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
     VkDescriptorBufferInfo infos[64];
     VkBufferView views[64];
     if (descriptorWriteCount <= 64 && pDescriptorWrites) {
-        memcpy(w, pDescriptorWrites, descriptorWriteCount * sizeof(w[0]));
-        memset(infos, 0, descriptorWriteCount * sizeof(infos[0]));
-        memset(views, 0, descriptorWriteCount * sizeof(views[0]));
-        rewrite_texel_buffers(w, descriptorWriteCount, infos, views);
+        uint32_t out_cnt = 0;
+        for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+            if (desc_write_is_null(&pDescriptorWrites[i]))
+                continue;
+            w[out_cnt++] = pDescriptorWrites[i];
+        }
+        if (out_cnt == 0)
+            return;
+        memset(infos, 0, out_cnt * sizeof(infos[0]));
+        memset(views, 0, out_cnt * sizeof(views[0]));
+        rewrite_texel_buffers(w, out_cnt, infos, views);
         if (real_CmdPushDescriptorSetKHR)
             real_CmdPushDescriptorSetKHR(commandBuffer, pipelineBindPoint, layout, set,
-                                         descriptorWriteCount, w);
+                                         out_cnt, w);
         return;
     }
     if (real_CmdPushDescriptorSetKHR)
@@ -2848,15 +3490,16 @@ static void VKAPI_CALL wrapped_UpdateDescriptorSets(VkDevice device,
 {
     resolve_device();
     int has_texel = 0;
+    int has_null = 0;
     if (pDescriptorWrites) {
         for (uint32_t i = 0; i < descriptorWriteCount; i++) {
-            if (pDescriptorWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+            if (pDescriptorWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER)
                 has_texel = 1;
-                break;
-            }
+            if (desc_write_is_null(&pDescriptorWrites[i]))
+                has_null = 1;
         }
     }
-    if (!has_texel && !g_debug) {
+    if (!has_texel && !has_null && !g_debug) {
         if (real_UpdateDescriptorSets)
             real_UpdateDescriptorSets(device, descriptorWriteCount, pDescriptorWrites,
                                       descriptorCopyCount, pDescriptorCopies);
@@ -2866,12 +3509,19 @@ static void VKAPI_CALL wrapped_UpdateDescriptorSets(VkDevice device,
     VkDescriptorBufferInfo infos[64];
     VkBufferView views[64];
     if (descriptorWriteCount <= 64 && pDescriptorWrites) {
-        memcpy(w, pDescriptorWrites, descriptorWriteCount * sizeof(w[0]));
-        memset(infos, 0, descriptorWriteCount * sizeof(infos[0]));
-        memset(views, 0, descriptorWriteCount * sizeof(views[0]));
-        rewrite_texel_buffers(w, descriptorWriteCount, infos, views);
+        uint32_t out_cnt = 0;
+        for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+            if (desc_write_is_null(&pDescriptorWrites[i]))
+                continue;
+            w[out_cnt++] = pDescriptorWrites[i];
+        }
+        if (out_cnt == 0 && descriptorCopyCount == 0)
+            return;
+        memset(infos, 0, out_cnt * sizeof(infos[0]));
+        memset(views, 0, out_cnt * sizeof(views[0]));
+        rewrite_texel_buffers(w, out_cnt, infos, views);
         if (real_UpdateDescriptorSets)
-            real_UpdateDescriptorSets(device, descriptorWriteCount, w, descriptorCopyCount,
+            real_UpdateDescriptorSets(device, out_cnt, w, descriptorCopyCount,
                                       pDescriptorCopies);
         return;
     }
@@ -3070,6 +3720,14 @@ static PFN_vkVoidFunction intercept(const char *name)
         return (PFN_vkVoidFunction)wrapped_CreateInstance;
     if (strcmp(name, "vkDestroyInstance") == 0)
         return (PFN_vkVoidFunction)wrapped_DestroyInstance;
+    if (strcmp(name, "vkEnumerateDeviceExtensionProperties") == 0)
+        return (PFN_vkVoidFunction)wrapped_EnumerateDeviceExtensionProperties;
+    if (strcmp(name, "vkGetPhysicalDeviceFeatures2") == 0 ||
+        strcmp(name, "vkGetPhysicalDeviceFeatures2KHR") == 0)
+        return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceFeatures2;
+    if (strcmp(name, "vkGetPhysicalDeviceProperties2") == 0 ||
+        strcmp(name, "vkGetPhysicalDeviceProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceProperties2;
     if (strcmp(name, "vkCreateDevice") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateDevice;
     if (strcmp(name, "vkDestroyDevice") == 0)
@@ -3090,6 +3748,8 @@ static PFN_vkVoidFunction intercept(const char *name)
         return (PFN_vkVoidFunction)wrapped_UpdateDescriptorSets;
     if (strcmp(name, "vkCreateBufferView") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateBufferView;
+    if (strcmp(name, "vkCreateImageView") == 0)
+        return (PFN_vkVoidFunction)wrapped_CreateImageView;
     if (strcmp(name, "vkCreateSampler") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateSampler;
     if (strcmp(name, "vkCmdPushDescriptorSetKHR") == 0 ||
@@ -3098,6 +3758,24 @@ static PFN_vkVoidFunction intercept(const char *name)
     if (strcmp(name, "vkQueueSubmit2KHR") == 0 ||
         strcmp(name, "vkQueueSubmit2") == 0)
         return (PFN_vkVoidFunction)wrapped_QueueSubmit2KHR;
+    if (strcmp(name, "vkCmdClearColorImage") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdClearColorImage;
+    if (strcmp(name, "vkCmdClearDepthStencilImage") == 0)
+        return (PFN_vkVoidFunction)wrapped_CmdClearDepthStencilImage;
+    if (strcmp(name, "vkEndCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)wrapped_EndCommandBuffer;
+    if (strcmp(name, "vkCmdBindTransformFeedbackBuffersEXT") == 0)
+        return (PFN_vkVoidFunction)noop_CmdBindTransformFeedbackBuffersEXT;
+    if (strcmp(name, "vkCmdBeginTransformFeedbackEXT") == 0)
+        return (PFN_vkVoidFunction)noop_CmdBeginTransformFeedbackEXT;
+    if (strcmp(name, "vkCmdEndTransformFeedbackEXT") == 0)
+        return (PFN_vkVoidFunction)noop_CmdEndTransformFeedbackEXT;
+    if (strcmp(name, "vkCmdBeginQueryIndexedEXT") == 0)
+        return (PFN_vkVoidFunction)noop_CmdBeginQueryIndexedEXT;
+    if (strcmp(name, "vkCmdEndQueryIndexedEXT") == 0)
+        return (PFN_vkVoidFunction)noop_CmdEndQueryIndexedEXT;
+    if (strcmp(name, "vkCmdDrawIndirectByteCountEXT") == 0)
+        return (PFN_vkVoidFunction)noop_CmdDrawIndirectByteCountEXT;
     if (want_linear_optimal() && strcmp(name, "vkCreateImage") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateImage;
     if (want_copysec()) {
@@ -3318,6 +3996,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice device,
 
 __attribute__((constructor)) static void shim_init(void)
 {
+    setenv("MESA_GL_VERSION_OVERRIDE", "4.5", 0);
+    setenv("MESA_GLSL_VERSION_OVERRIDE", "450", 0);
+    setenv("MESA_GLES_VERSION_OVERRIDE", "3.2", 0);
     const char *env = getenv("VKC_DIR");
     if (env && *env)
         snprintf(g_dir, sizeof(g_dir), "%s", env);

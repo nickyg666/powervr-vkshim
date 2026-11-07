@@ -10,6 +10,16 @@
         "functions": {
             "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
         },
+        "device_extensions": [
+            {
+                "name": "VK_EXT_robustness2",
+                "spec_version": "1"
+            },
+            {
+                "name": "VK_EXT_transform_feedback",
+                "spec_version": "1"
+            }
+        ],
         "disable_environment": {
             "DISABLE_VK_LAYER_POWERVR_COMPAT": "1"
         }
