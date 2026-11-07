@@ -2386,9 +2386,9 @@ static VkResult VKAPI_CALL wrapped_BeginCommandBuffer(
     resolve_device();
     resolve_copyfns();
     cs_track_begin(cb);
-    { static int dbgN; if (++dbgN <= 3) LOG("begin #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
-    if ((g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
-        LOG("DUMPING atlas.ppm");
+    { static int dbgN; if (++dbgN <= 3) DBG("begin #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
+    if (g_debug && (g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
+        DBG("DUMPING atlas.ppm");
         FILE *f = fopen("/tmp/atlas.ppm", "wb");
         if (f) {
             fprintf(f, "P6\n1024 1024\n255\n");
@@ -2398,7 +2398,7 @@ static VkResult VKAPI_CALL wrapped_BeginCommandBuffer(
         }
         g_atlas_done++;
         if (g_atlas_done == 2)
-            LOG("atlas dumped to /tmp/atlas.ppm");
+            DBG("atlas dumped to /tmp/atlas.ppm");
     }
     if (real_BeginCommandBuffer)
         return real_BeginCommandBuffer(cb, bi);
@@ -2411,8 +2411,8 @@ static void VKAPI_CALL wrapped_ResetCommandBuffer(VkCommandBuffer cb,
     resolve_device();
     resolve_copyfns();
     cs_track_reset(cb);
-    { static int dbgN; if (++dbgN <= 3) LOG("reset #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
-    if ((g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
+    { static int dbgN; if (++dbgN <= 3) DBG("reset #%d: done=%d ubo=%d ptr=%p", dbgN, g_atlas_done, g_ubo_done, (void *)g_atlas_ptr); }
+    if (g_debug && (g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
         FILE *f = fopen("/tmp/atlas.ppm", "wb");
         if (f) {
             fprintf(f, "P6\n1024 1024\n255\n");
@@ -2420,7 +2420,7 @@ static void VKAPI_CALL wrapped_ResetCommandBuffer(VkCommandBuffer cb,
                 fwrite(g_atlas_ptr + (size_t)y * 1024 * 4, 1, 1024 * 3, f);
             fclose(f);
         }
-        LOG("DUMPING atlas.ppm (at reset)");
+        DBG("DUMPING atlas.ppm (at reset)");
         g_atlas_done = 0;
         g_ubo_done = 0;
     }
@@ -2626,14 +2626,14 @@ static void rewrite_texel_buffers(VkWriteDescriptorSet *w, uint32_t count,
         }
         pthread_mutex_unlock(&g_bufview_mtx);
         if (!bi) {
-            LOG("push descriptor: unknown buffer view %p - leaving it alone", (void *)h);
+            DBG("push descriptor: unknown buffer view %p - leaving it alone", (void *)h);
             continue;
         }
         w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         w[i].pImageInfo = NULL;
         w[i].pTexelBufferView = NULL;
         w[i].pBufferInfo = &infos[i];
-        LOG("push descriptor: texel buffer %p -> storage buffer (buffer=%p offset=%llu range=%llu)",
+        DBG("push descriptor: texel buffer %p -> storage buffer (buffer=%p offset=%llu range=%llu)",
             (void *)h, (void *)bi->buffer, (unsigned long long)bi->offset,
             (unsigned long long)bi->range);
     }
@@ -2663,14 +2663,14 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
         rewrite_texel_buffers(w, descriptorWriteCount, infos, views);
         for (uint32_t i = 0; i < descriptorWriteCount; i++) {
             if (w[i].pBufferInfo && (w[i].pBufferInfo->offset || w[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER))
-                LOG("push desc: binding=%u type=%d offset=%llu range=%llu",
+                DBG("push desc: binding=%u type=%d offset=%llu range=%llu",
                     w[i].dstBinding, (int)w[i].descriptorType,
                     (unsigned long long)w[i].pBufferInfo->offset,
                     (unsigned long long)w[i].pBufferInfo->range);
-            { static int dbg0; if (!dbg0++) LOG("push wrapper hit, first count=%u", descriptorWriteCount); }
-            if ((g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
+            { static int dbg0; if (!dbg0++) DBG("push wrapper hit, first count=%u", descriptorWriteCount); }
+            if (g_debug && (g_atlas_done >= 1 || g_ubo_done) && g_atlas_ptr) {
                 static int dumpn;
-                if (++dumpn % 2000 == 0) {
+                if (++dumpn % 2000 == 0 && g_atlas_done < 9) {
                     FILE *f = fopen("/tmp/atlas.ppm", "wb");
                     if (f) {
                         fprintf(f, "P6\n1024 1024\n255\n");
@@ -2678,7 +2678,7 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
                             fwrite(g_atlas_ptr + (size_t)y * 1024 * 4, 1, 1024 * 3, f);
                         fclose(f);
                     }
-                    LOG("DUMPING atlas.ppm (at push)");
+                    DBG("DUMPING atlas.ppm (at push)");
                 }
             }
             if (getenv("VKC_DUMP_UBO") && g_atlas_dbg && g_atlas_ptr && !g_ubo_done &&
@@ -2697,12 +2697,12 @@ static void VKAPI_CALL wrapped_CmdPushDescriptorSetKHR(VkCommandBuffer commandBu
                 bc.size = 64;
                 rq5(commandBuffer, w[i].pBufferInfo->buffer, g_atlas_dbg, 1, &bc);
                 g_ubo_done = 1;
-                LOG("ubo readback recorded: binding=%u offset=%llu", w[i].dstBinding,
+                DBG("ubo readback recorded: binding=%u offset=%llu", w[i].dstBinding,
                     (unsigned long long)w[i].pBufferInfo->offset);
                 g_atlas_done = 1;
             }
             if (w[i].pImageInfo)
-                LOG("push img: binding=%u type=%d view=%p sampler=%p layout=%d",
+                DBG("push img: binding=%u type=%d view=%p sampler=%p layout=%d",
                     w[i].dstBinding, (int)w[i].descriptorType,
                     (void *)w[i].pImageInfo->imageView,
                     (void *)w[i].pImageInfo->sampler,
