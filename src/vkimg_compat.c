@@ -69,29 +69,19 @@ static int g_crashfd = -1;
 static struct sigaction g_old_segv, g_old_bus;
 
 /* async signal safe crash reporter - writes straight to a file, because the
-   application's stderr is usually swallowed by the launcher */
+   application's stderr is usually swallowed by the launcher.
+   IMPORTANT: async-signal-safe only. No backtrace()/backtrace_symbols()/malloc/
+   free/snprintf-with-floats here - a fault while handling a fault kills the
+   process outright (we saw that first hand with glxgears: handler faulted at
+   +0x3318 and the process died before it could report anything). */
 static void segv_handler(int sig, siginfo_t *si, void *ctx)
 {
-    char buf[512];
-    int n = snprintf(buf, sizeof(buf),
-                     "\n*** signal %d in shim, addr=%p, last driver op: %s ***\n", sig,
-                     si ? si->si_addr : NULL, g_last_op ? g_last_op : "(none)");
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "\n*** signal %d in shim, addr=%p, last driver op: %s ***\n", sig,
+                      si ? si->si_addr : NULL, g_last_op ? g_last_op : "(none)");
     if (g_crashfd >= 0) {
         ssize_t ignored = write(g_crashfd, buf, (size_t)n);
         (void)ignored;
-    }
-    void *bt[32];
-    int cnt = backtrace(bt, 32);
-    char **syms = backtrace_symbols(bt, cnt);
-    if (syms) {
-        for (int i = 0; i < cnt && i < 24; i++) {
-            n = snprintf(buf, sizeof(buf), "    #%d %s\n", i, syms[i]);
-            if (g_crashfd >= 0) {
-                ssize_t ignored = write(g_crashfd, buf, (size_t)n);
-                (void)ignored;
-            }
-        }
-        free(syms);
     }
     /* chain to the previous handler (the JVM installs its own) */
     if (sig == SIGSEGV && g_old_segv.sa_flags & SA_SIGINFO)
