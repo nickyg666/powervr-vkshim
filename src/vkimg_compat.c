@@ -115,6 +115,62 @@ static VkImage   g_viewimgs[VIEWMAP_MAX];
 static int       g_viewn;
 static int       g_view_next;
 static pthread_mutex_t g_view_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* image extent map, so dynamic-rendering folds know if the render area */
+#define IMGMAP_MAX 2048
+static VkImage   g_imgmap[IMGMAP_MAX];
+static uint32_t  g_imgw[IMGMAP_MAX];
+static uint32_t  g_imgh[IMGMAP_MAX];
+static int       g_imgn;
+static int       g_img_next;
+
+static void img_record(VkImage image, uint32_t w, uint32_t h)
+{
+    if (!image || w == 0 || h == 0)
+        return;
+    pthread_mutex_lock(&g_view_mtx);
+    for (int i = 0; i < g_imgn; i++) {
+        if (g_imgmap[i] == image) {
+            g_imgw[i] = w;
+            g_imgh[i] = h;
+            pthread_mutex_unlock(&g_view_mtx);
+            return;
+        }
+    }
+    int idx = g_img_next % IMGMAP_MAX;
+    g_imgmap[idx] = image;
+    g_imgw[idx] = w;
+    g_imgh[idx] = h;
+    g_img_next++;
+    if (g_imgn < IMGMAP_MAX)
+        g_imgn++;
+    pthread_mutex_unlock(&g_view_mtx);
+}
+
+static int img_extent(VkImage image, uint32_t *w, uint32_t *h)
+{
+    if (!image)
+        return 0;
+    int found = 0;
+    uint32_t fw = 0, fh = 0;
+    pthread_mutex_lock(&g_view_mtx);
+    for (int i = 0; i < g_imgn; i++) {
+        if (g_imgmap[i] == image) {
+            fw = g_imgw[i];
+            fh = g_imgh[i];
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_view_mtx);
+    if (found) {
+        if (w)
+            *w = fw;
+        if (h)
+            *h = fh;
+    }
+    return found;
+}
 static int       g_rt_done;
 static int       g_ubo_done;
 static int       g_rt_big_done;
@@ -1532,6 +1588,95 @@ static void VKAPI_CALL wrapped_GetPhysicalDeviceProperties2(
     }
 }
 
+typedef struct VkFormatProperties3_local {
+    VkStructureType sType;
+    void *pNext;
+    uint64_t linearTilingFeatures;
+    uint64_t optimalTilingFeatures;
+    uint64_t bufferFeatures;
+} VkFormatProperties3_local;
+#define VKC_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 ((VkStructureType)1000360000)
+
+static void fixup_format_props(VkFormat format, VkFormatProperties *fp)
+{
+    if (!fp)
+        return;
+    /* PowerVR supports VK_IMAGE_USAGE_STORAGE_BIT on BGRA8 and ABGR8_PACK32 in
+     * vkCreateImage / vkGetPhysicalDeviceImageFormatProperties, but omits
+     * VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT in vkGetPhysicalDeviceFormatProperties. */
+    if (format == VK_FORMAT_B8G8R8A8_UNORM ||
+        format == VK_FORMAT_A8B8G8R8_UNORM_PACK32 ||
+        format == VK_FORMAT_A8B8G8R8_SNORM_PACK32 ||
+        format == VK_FORMAT_A8B8G8R8_UINT_PACK32 ||
+        format == VK_FORMAT_A8B8G8R8_SINT_PACK32) {
+        if (fp->optimalTilingFeatures)
+            fp->optimalTilingFeatures |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    }
+}
+
+static void VKAPI_CALL wrapped_GetPhysicalDeviceFormatProperties(
+    VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties *pFormatProperties)
+{
+    PFN_vkGetPhysicalDeviceFormatProperties fn = NULL;
+#ifdef AS_LAYER
+    if (next_gipa)
+        fn = (PFN_vkGetPhysicalDeviceFormatProperties)next_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceFormatProperties");
+#endif
+    if (!fn && g_drv_gipa)
+        fn = (PFN_vkGetPhysicalDeviceFormatProperties)g_drv_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceFormatProperties");
+    if (fn)
+        fn(physicalDevice, format, pFormatProperties);
+    fixup_format_props(format, pFormatProperties);
+}
+
+static void VKAPI_CALL wrapped_GetPhysicalDeviceFormatProperties2(
+    VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2 *pFormatProperties)
+{
+    PFN_vkGetPhysicalDeviceFormatProperties2 fn = NULL;
+#ifdef AS_LAYER
+    if (next_gipa) {
+        fn = (PFN_vkGetPhysicalDeviceFormatProperties2)next_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceFormatProperties2");
+        if (!fn)
+            fn = (PFN_vkGetPhysicalDeviceFormatProperties2)next_gipa(
+                layer_instance ? layer_instance : VK_NULL_HANDLE,
+                "vkGetPhysicalDeviceFormatProperties2KHR");
+    }
+#endif
+    if (!fn && g_drv_gipa) {
+        fn = (PFN_vkGetPhysicalDeviceFormatProperties2)g_drv_gipa(
+            layer_instance ? layer_instance : VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceFormatProperties2");
+        if (!fn)
+            fn = (PFN_vkGetPhysicalDeviceFormatProperties2)g_drv_gipa(
+                layer_instance ? layer_instance : VK_NULL_HANDLE,
+                "vkGetPhysicalDeviceFormatProperties2KHR");
+    }
+    if (fn)
+        fn(physicalDevice, format, pFormatProperties);
+    if (!pFormatProperties)
+        return;
+    fixup_format_props(format, &pFormatProperties->formatProperties);
+    for (VkBaseOutStructure *p = (VkBaseOutStructure *)pFormatProperties->pNext; p; p = p->pNext) {
+        if (p->sType == VKC_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
+            VkFormatProperties3_local *fp3 = (VkFormatProperties3_local *)p;
+            if ((format == VK_FORMAT_B8G8R8A8_UNORM ||
+                 format == VK_FORMAT_A8B8G8R8_UNORM_PACK32 ||
+                 format == VK_FORMAT_A8B8G8R8_SNORM_PACK32 ||
+                 format == VK_FORMAT_A8B8G8R8_UINT_PACK32 ||
+                 format == VK_FORMAT_A8B8G8R8_SINT_PACK32) &&
+                fp3->optimalTilingFeatures) {
+                fp3->optimalTilingFeatures |= (uint64_t)VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+            }
+        }
+    }
+}
+
 static void VKAPI_CALL noop_CmdBindTransformFeedbackBuffersEXT(
     VkCommandBuffer cb, uint32_t firstBinding, uint32_t bindingCount,
     const VkBuffer *pBuffers, const VkDeviceSize *pOffsets, const VkDeviceSize *pSizes)
@@ -2710,13 +2855,13 @@ static void pclear_add_depth(VkCommandBuffer cb, VkImage image, VkImageLayout la
 
 static void pclear_flush_image(VkCommandBuffer cb, VkImage image)
 {
-    struct pending_clear to_flush[2];
+    struct pending_clear to_flush[MAX_PENDING_CLEARS];
     int nflush = 0;
     pthread_mutex_lock(&g_pclear_mtx);
     for (int i = 0; i < MAX_PENDING_CLEARS; i++) {
         if (g_pclears[i].used && g_pclears[i].cb == cb &&
             (image == VK_NULL_HANDLE || g_pclears[i].image == image)) {
-            if (nflush < 2)
+            if (nflush < MAX_PENDING_CLEARS)
                 to_flush[nflush++] = g_pclears[i];
             g_pclears[i].used = 0;
         }
@@ -3019,6 +3164,11 @@ static void VKAPI_CALL wrapped_CmdBeginRenderPassTracking(
     VkCommandBuffer cb, const VkRenderPassBeginInfo *i, VkSubpassContents c)
 {
     resolve_copyfns();
+    /* Pending out-of-pass clears must execute before the pass starts; they
+     * cannot be deferred to EndCommandBuffer or they will overwrite the
+     * pass contents (blue fullscreen flash on underwater transitions). */
+    if (!cs_in_pass(cb))
+        pclear_flush_image(cb, VK_NULL_HANDLE);
     cs_track_beginpass(cb);
     if (real_CmdBeginRenderPass)
         real_CmdBeginRenderPass(cb, i, c);
@@ -3037,6 +3187,8 @@ static void VKAPI_CALL wrapped_CmdBeginRenderPass2Tracking(
     const VkSubpassBeginInfo *i2)
 {
     resolve_copyfns();
+    if (!cs_in_pass(cb))
+        pclear_flush_image(cb, VK_NULL_HANDLE);
     cs_track_beginpass(cb);
     if (real_CmdBeginRenderPass2)
         real_CmdBeginRenderPass2(cb, i, i2);
@@ -3116,7 +3268,6 @@ static void VKAPI_CALL wrapped_CmdBeginRenderingTracking(
     VkRenderingAttachmentInfo color_atts[8];
     VkRenderingAttachmentInfo depth_att;
     int modified = 0;
-    int full_area = (i->renderArea.offset.x == 0 && i->renderArea.offset.y == 0);
 
     if (i->colorAttachmentCount > 0 && i->colorAttachmentCount <= 8 && i->pColorAttachments) {
         memcpy(color_atts, i->pColorAttachments,
@@ -3125,7 +3276,15 @@ static void VKAPI_CALL wrapped_CmdBeginRenderingTracking(
             VkImage img = (VkImage)vimg((void *)color_atts[k].imageView);
             if (!img)
                 continue;
-            if (!full_area && color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            /* Only fold a full-image pending clear into a full-area pass.
+             * A scissored/sub-area pass must not subsume the clear. */
+            uint32_t iw = 0, ih = 0;
+            int have_ext = img_extent(img, &iw, &ih);
+            int full_area = (i->renderArea.offset.x == 0 && i->renderArea.offset.y == 0 &&
+                             (!have_ext ||
+                              (i->renderArea.extent.width >= iw && i->renderArea.extent.height >= ih)));
+            if (!full_area && (color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+                               color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE)) {
                 pclear_flush_image(cb, img);
                 continue;
             }
@@ -3133,7 +3292,8 @@ static void VKAPI_CALL wrapped_CmdBeginRenderingTracking(
             for (int p = 0; p < MAX_PENDING_CLEARS; p++) {
                 if (g_pclears[p].used && g_pclears[p].cb == cb &&
                     g_pclears[p].image == img && !g_pclears[p].is_depth) {
-                    if (color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                    if (color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+                        color_atts[k].loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE) {
                         color_atts[k].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
                         color_atts[k].clearValue.color = g_pclears[p].color;
                         modified = 1;
@@ -3152,14 +3312,21 @@ static void VKAPI_CALL wrapped_CmdBeginRenderingTracking(
         depth_att = *i->pDepthAttachment;
         VkImage img = (VkImage)vimg((void *)depth_att.imageView);
         if (img) {
-            if (!full_area && depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            uint32_t iw = 0, ih = 0;
+            int have_ext = img_extent(img, &iw, &ih);
+            int full_area = (i->renderArea.offset.x == 0 && i->renderArea.offset.y == 0 &&
+                             (!have_ext ||
+                              (i->renderArea.extent.width >= iw && i->renderArea.extent.height >= ih)));
+            if (!full_area && (depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+                               depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE)) {
                 pclear_flush_image(cb, img);
             } else {
                 pthread_mutex_lock(&g_pclear_mtx);
                 for (int p = 0; p < MAX_PENDING_CLEARS; p++) {
                     if (g_pclears[p].used && g_pclears[p].cb == cb &&
                         g_pclears[p].image == img && g_pclears[p].is_depth) {
-                        if (depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                        if (depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+                            depth_att.loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE) {
                             depth_att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
                             depth_att.clearValue.depthStencil = g_pclears[p].depth;
                             ri.pDepthAttachment = &depth_att;
@@ -3282,6 +3449,8 @@ static VkResult VKAPI_CALL wrapped_CreateImage(VkDevice device,
     }
     if (real_CreateImage)
         r = real_CreateImage(device, ci, pAllocator, pImage);
+    if (r == VK_SUCCESS && pImage && *pImage && pCreateInfo)
+        img_record(*pImage, pCreateInfo->extent.width, pCreateInfo->extent.height);
     if (r == VK_SUCCESS && pCreateInfo && getenv("VKC_LOG_IMAGES"))
         LOG("image %p: %dx%d format=%d mips=%u layers=%u samples=%d tiling=%d usage=0x%x",
             (void *)(pImage ? *pImage : NULL), pCreateInfo->extent.width,
@@ -3718,6 +3887,11 @@ static PFN_vkVoidFunction intercept(const char *name)
     if (strcmp(name, "vkGetPhysicalDeviceProperties2") == 0 ||
         strcmp(name, "vkGetPhysicalDeviceProperties2KHR") == 0)
         return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceProperties2;
+    if (strcmp(name, "vkGetPhysicalDeviceFormatProperties") == 0)
+        return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceFormatProperties;
+    if (strcmp(name, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+        strcmp(name, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceFormatProperties2;
     if (strcmp(name, "vkCreateDevice") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateDevice;
     if (strcmp(name, "vkDestroyDevice") == 0)
@@ -3766,7 +3940,7 @@ static PFN_vkVoidFunction intercept(const char *name)
         return (PFN_vkVoidFunction)noop_CmdEndQueryIndexedEXT;
     if (strcmp(name, "vkCmdDrawIndirectByteCountEXT") == 0)
         return (PFN_vkVoidFunction)noop_CmdDrawIndirectByteCountEXT;
-    if (want_linear_optimal() && strcmp(name, "vkCreateImage") == 0)
+    if (strcmp(name, "vkCreateImage") == 0)
         return (PFN_vkVoidFunction)wrapped_CreateImage;
     if (want_copysec()) {
         if (strcmp(name, "vkCmdCopyBufferToImage") == 0)
